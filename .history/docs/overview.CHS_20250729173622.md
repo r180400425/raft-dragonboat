@@ -154,49 +154,22 @@ NodeHost同时提供名为StaleRead的函数，如它的方法名称所表述的
 * 对于普通状态机，建议一天保存1-2次快照
 * 对于基于磁盘的状态机，建议每小时保存一次快照
 
-用户也可以使用NodeHost的**RequestSnapshot**方法对指定的Raft组请求创建快照。使用DefaultSnapshotOption所创建的快照就是一个普通快照，它由系统管理。如果讲SnapshotOption的Exported值设为true，那么所创建的快照会被导出到ExportPath所指向的目录，导出后的快照可备份后未来被用于修复已永久丢失多数节点的Raft组，导出至上述指定目录的快照由用户完全负责保存、转移和释放清理，系统不再干预。对于所请求的非导出的快照，用户同时可以通过SnapshotOption的OverrideCompactionOverhead和CompactionOverhead值来控制每次请求的快照产生以后多少已在快照中包含的Log需要被清理以释放磁盘空间。
+用户也可以使用NodeHost的RequestSnapshot方法对指定的Raft组请求创建快照。使用DefaultSnapshotOption所创建的快照就是一个普通快照，它由系统管理。如果讲SnapshotOption的Exported值设为true，那么所创建的快照会被导出到ExportPath所指向的目录，导出后的快照可备份后未来被用于修复已永久丢失多数节点的Raft组，导出至上述指定目录的快照由用户完全负责保存、转移和释放清理，系统不再干预。对于所请求的非导出的快照，用户同时可以通过SnapshotOption的OverrideCompactionOverhead和CompactionOverhead值来控制每次请求的快照产生以后多少已在快照中包含的Log需要被清理以释放磁盘空间。
 
 上述导出的快照，可以在多数节点均永久失效以后通过tools包提供的ImportSnapshot方法被用来修复已无法使用的Raft组。此时因为Raft组的多数节点已经永久失效，数据已有丢失，该操作为数据有损操作。用户程序应该通过设置合理的副本数以及加强服务器监控维护，通过避免发生多数节点永久失效来规避数据丢失问题。请注意，多数节点发生可恢复的失效，比如多数节点发生重启或短暂网络故障，并不会引起已保存数据的丢失。多数节点永久失效是指多数服务器上的磁盘损坏或服务器永久不再可用等故障。ImportSnapshot具体使用请参考其godoc文档。
 
 ## Gossip ##
 
-默认下，每个Raft组的每个副本在被加入系统时都由**用户**明确指定它所在的节点的**RaftAddress**位置，系统以此确保各类Raft消息可以被正确发送给该副本。该方案简单直接，但缺点是RaftAddress必须是固定不变的，这要求使用固定的IP或者由用户维护一个DNS Name。在这一要求无法满足时，可以使用**gossip**功能来规避这一问题。
+默认下，每个Raft组的每个副本在被加入系统时都由用户明确指定它所在的节点的RaftAddress位置，系统以此确保各类Raft消息可以被正确发送给该副本。该方案简单直接，但缺点是RaftAddress必须是固定不变的，这要求使用固定的IP或者由用户维护一个DNS Name。在这一要求无法满足时，可以使用gossip功能来规避这一问题。
 
-从v3.3版本开始，每个**NodeHost节点**都会被**随机**分配一个永久固定**不变**的**NodeHostID**值，它的值如nhid-1234567890形式，该值可由NodeHost的ID方法返回。在NodeHostConfig的DefaultNodeRegistryEnabled项被设置为真后，所有新创建的副本都需要被指定其对应的NodeHostID值。此后，每次启动NodeHost实例时用于NodeHost间通讯的RaftAddress值可随意变化，每个NodeHost实例的RaftAddress与NodeHostID的对应关系将自动由后台的一个gossip服务来动态的维护，当Raft消息需要在两个副本间传递时，首先发生ReplicaID到NodeHostID的转换，接着由NodeHostID通过gossip服务查询得到对应的RaftAddress地址并完成消息副本间的传输。
+从v3.3版本开始，每个NodeHost节点都会被随机分配一个永久固定不变的NodeHostID值，它的值如nhid-1234567890形式，该值可由NodeHost的ID方法返回。在NodeHostConfig的DefaultNodeRegistryEnabled项被设置为真后，所有新创建的副本都需要被指定其对应的NodeHostID值。此后，每次启动NodeHost实例时用于NodeHost间通讯的RaftAddress值可随意变化，每个NodeHost实例的RaftAddress与NodeHostID的对应关系将自动由后台的一个gossip服务来动态的维护，当Raft消息需要在两个副本间传递时，首先发生ReplicaID到NodeHostID的转换，接着由NodeHostID通过gossip服务查询得到对应的RaftAddress地址并完成消息副本间的传输。
 
 Gossip服务本身是一个全分布的网络服务，用户仅需要通过NodeHostConfig.Gossip项简单设置其相关地址参数即可。
-
-
-
-### 解释 ###
-就是固定地址和动态映射的关系，类似物理地址和虚拟地址
-
-启用Gossip时，NodeHostID固定，作为标识，RaftAddress可动态变化，其与NodeHostID的对应关系由Gossip服务自动维护。
-
-| 默认RaftAddress方式 | Gossip动态地址方式 |
-|--------------------------------------|----------------------------------------|
-| 依赖用户指定固定RaftAddress（IP/DNS） | 依赖永久NodeHostID + Gossip动态解析地址 |
-| 地址变更会导致副本失联 | 地址变更由Gossip自动同步，不影响可用性 |
-| 适用于静态网络环境（固定IP/物理机） | 适用于动态网络环境（云服务器/弹性IP） |
-
-
-| 概念 | 本质 | 标识 | 作用范围 |
-|------------|--------------------|--------------------|------------------------|
-| 副本（Replica） | 数据冗余单元（数据拷贝实例） | ReplicaID（组内唯一） | Raft组内 |
-| 节点（Node） | 副本的代码实例 | 同ReplicaID | Raft组内 |
-| 服务器（Server）| 物理/虚拟硬件宿主 | IP/主机名 | 承载多个NodeHost/节点 |
-
-节点是副本在代码层面的具体实现，是Raft组的成员。文档明确说明：“节点Node：Raft组中的一个成员副本”，即节点 ≈ 副本，是同一概念的不同表述（“节点”更侧重代码层面的实例，“副本”更侧重数据冗余的逻辑概念）。
-
-节点由 NodeHost 组件管理，每个NodeHost可以运行多个节点（属于不同Raft组）。
-
-通过这种层级关系，Dragonboat实现了“多副本跨服务器部署”，从而保证分布式系统的高可用和数据一致性。
-
 
 ## 其它功能 ##
 
 Dragonboat通过NodeHost提供下列其它常用功能：
 
-* Non-Voting节点。观察者节点不参与Leader的选举，不参与一个提议是否可以被采纳，它仅仅用来接受并执行Raft组各个已采纳的提议。观察者节点的状态机与普通节点一样，正常情况下将具备完整且相同的状态机状态，它可以被用来做为一个额外的只读节点，供用户读取有一致性保证的状态机状态。观察者节点的另一大作用是**允许一个新加入的节点以观察者身份加入Raft组，在其逐渐获取所有状态机状态后再提升其为正常节点**。在观察者节点所在的NodeHost上发起一次SyncRead或者一次GetShardMembership，如果成功返回则表示ReadIndex协议被完整执行了一轮，这表示观察者节点已经拥有基本所有Log Entry，具备了将其升级为正常节点的条件。
+* Non-Voting节点。观察者节点不参与Leader的选举，不参与一个提议是否可以被采纳，它仅仅用来接受并执行Raft组各个已采纳的提议。观察者节点的状态机与普通节点一样，正常情况下将具备完整且相同的状态机状态，它可以被用来做为一个额外的只读节点，供用户读取有一致性保证的状态机状态。观察者节点的另一大作用是允许一个新加入的节点以观察者身份加入Raft组，在其逐渐获取所有状态机状态后再提升其为正常节点。在观察者节点所在的NodeHost上发起一次SyncRead或者一次GetShardMembership，如果成功返回则表示ReadIndex协议被完整执行了一轮，这表示观察者节点已经拥有基本所有Log Entry，具备了将其升级为正常节点的条件。
 * Leader迁移。正常情况下，Leader以选举方式由用户程序透明的方式选举产生。用户可以使用NodeHost提供的RequestLeaderTransfer方法尝试将Leader迁移至指定节点。
 * NodeHost同时提供GetNodeHostInfo与GetShardMembership方法供查询当前各NodeHost管理下的各Raft组信息。

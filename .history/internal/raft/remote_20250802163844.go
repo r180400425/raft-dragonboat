@@ -188,178 +188,59 @@ func (r *remote) clearPendingSnapshot() {
 
 /* -----------复制进度更新方法----------- */
 
-/*
-tryUpdate 函数由 领导者节点（Leader） 在以下场景中调用：
-	当领导者收到 跟随者节点（Follower） 或 候选者节点（Candidate） 的 AppendEntries 响应（日志复制成功确认）时，用于更新对该远程节点的日志复制进度跟踪。
-
-调用场景细节
-	触发条件
-		领导者向远程节点发送 AppendEntries RPC（包含日志条目）后，若远程节点成功复制日志，会在响应中返回其已复制的 最高日志索引（即 index 参数）。领导者通过 tryUpdate(index) 处理该响应，更新对该远程节点的 match（已确认复制的最高索引）和 next（下一条待发送索引）。
-
-	核心目的
-		动态调整 next 索引，避免重复发送已复制的日志（next = index + 1）。
-		更新 match 索引，作为领导者计算 集群已提交日志索引（commitIndex）的依据（需多数节点的 match 达到同一索引）。
-
-调用方与被调用方角色
-	调用方：只能是 领导者节点（只有领导者负责日志复制和进度跟踪）。
-	被调用方：领导者维护的 remote 结构体实例（对应每个远程节点，包括跟随者和候选者）。
-
-典型调用链路
-	领导者向远程节点发送 AppendEntries RPC（包含日志条目）。
-	远程节点成功复制日志后，返回响应，包含其已复制的最高日志索引 index。
-	领导者接收响应，调用 remote.tryUpdate(index) 更新该节点的复制进度。
-	tryUpdate 调整 next 和 match，并根据需要转换远程节点的复制状态（如从 Wait 转为 Retry，触发后续日志发送）。
-
-*/
-
-// “tryUpdate 是领导者节点用于跟踪远程节点（跟随者/候选者）日志复制进度的核心更新方法，用于根据远程节点反馈的‘已成功复制的最高日志索引’（index），动态调整领导者对该节点的复制状态（match 和 next 索引），确保日志复制高效推进。”
-
+// 尝试根据远程节点的已复制状态索引 更新 本地跟踪状态
 func (r *remote) tryUpdate(index uint64) bool {
-	// 参数 index：远程节点已成功复制的最高日志索引（由远程节点通过 AppendEntries 响应返回）。
-
-	// 更新r. next（如果有需要）
-	// r. next是领导者计划发送给远程节点r的下一条日志索引
-	// 若远程节点已复制到index，下一条应该从index+1开始
-	// 该if是为了避免重复发送已复制的日志
-	if r.next < index+1 {
+	// index是远程节点的已成功复制的日志索引
+	if r.next < index+1 { //优化下次发起起点
 		r.next = index + 1
 	}
-
-	// 2.更新已匹配索引：仅当远程节点的复制进度index超过match时更新
-	// r.match是远程节点已确认复制的最高日志索引（记录）
-	// index是远程节点已复制的最高日志索引（实际）
-	// 如果记录的match < 实际的index，则更新match
-	if r.match < index {
-		r.waitToRetry() // 若远程节点此前处于 Wait 状态（因前次发送未响应而等待），此时因远程节点已反馈新进度，需转为 Retry 状态以主动发送后续日志（避免持续等待）。
-		r.match = index // 更新 match 为远程节点已确认的最高索引
-		return true     //表示更新match
+	if r.match < index { //说明已复制的日志索引 小于 远程节点的已复制状态索引
+		r.waitToRetry()
+		r.match = index
+		return true
 	}
-	// 若 index 小于等于当前 match（远程节点未提供新进度），或 next 已处于正确位置，则无需更新状态，返回 false。
-	return false //无需更新
+	// r.match >= index  说明已复制的日志索引 大于等于 远程节点的已复制状态索引
+	return false
 }
 
-// 更新复制进度（领导者在发送日志后调用，根据远程节点的最新日志索引lastIndex调整r. next）
 func (r *remote) progress(lastIndex uint64) {
-	// lastIndex 是 远程节点的最新日志索引
-	// 注意状态：仅在复制和重试状态
 	if r.state == remoteReplicate {
-		r.next = lastIndex + 1 // 将下一个待发送索引设置为 lastIndex + 1
+		r.next = lastIndex + 1
 	} else if r.state == remoteRetry {
-		r.retryToWait() // 若当前是重试状态，将状态切换为等待状态
-
-		/*
-			1. 避免过度频繁的重试
-				当节点处于 remoteRetry 状态时，领导者会积极地向该节点发送日志。如果刚刚发送了一次日志（调用 progress 方法），应该暂时进入等待状态，避免过于频繁的重试：
-			2. 实现发送节奏控制
-				这种状态转换实现了简单的流量控制机制：
-					remoteRetry 状态：允许发送日志
-					remoteWait 状态：暂停发送，等待响应
-					通过在发送后立即切换到 Wait 状态，可以避免网络拥塞和资源浪费。
-			3. 符合 Raft 算法的流控设计
-				这是从 etcd raft 继承的流控机制：
-					当领导者向跟随者发送日志后，暂时进入等待状态
-					等待跟随者的响应后再决定下一步动作
-					如果收到响应，可能切换回 Retry 或 Replicate 状态
-					如果超时，可能通过其他机制重新激活
-		*/
-
+		r.retryToWait()
 	} else {
 		panic("unexpected remote state")
 	}
 }
 
-/*
-
-示例
-
-1. 领导者发现跟随者日志落后太多
-   → 调用 becomeSnapshot() 进入 Snapshot 状态
-
-2. 发送快照数据给跟随者
-   → 跟随者接收并应用快照
-
-3. 跟随者确认快照应用完成
-   → match >= snapshotIndex 成立
-   → 调用 respondedTo() 转换为 Retry 状态
-
-4. 发送快照后的第一条日志
-   → 跟随者成功响应
-   → 调用 respondedTo() 转换为 Replicate 状态
-
-5. 开始高效流水线复制
-
-
-选择 remoteRetry 状态的原因：
-
-	稳妥的过渡：
-
-	快照同步是一个重大操作，完成后需要谨慎处理
-	remoteRetry 状态是比 remoteReplicate 更保守的状态
-	允许系统逐步验证连接的稳定性和数据的一致性
-	准备后续日志复制：
-
-	快照同步完成后，通常需要发送一些后续日志来保持一致性
-	remoteRetry 状态适合这种场景，可以逐步发送日志并等待确认
-	符合状态机设计原则：
-
-	remoteSnapshot → remoteRetry → remoteReplicate
-	这是一个渐进的转换过程，每一步都有明确的触发条件
-
-*/
-
-// 处理远程节点的响应事件（领导者收到远程节点的消息后调用）
 func (r *remote) respondedTo() {
-
-	if r.state == remoteRetry { //如果节点r在重试状态
-		r.becomeReplicate() //进入正常的复制状态
-
-		// 远程节点成功响应表明网络连接正常，可以从保守的重试模式切换到高效的流水线复制模式
-
-	} else if r.state == remoteSnapshot { //如果节点r在快照同步状态
-		// r.match：远程节点已确认复制的最高日志索引
-		// r.snapshotIndex：正在同步的快照对应的日志索引
-		if r.match >= r.snapshotIndex { //说明快照同步已经完成
-			r.becomeRetry() //进入重试状态，准备发送后续日志
+	if r.state == remoteRetry {
+		r.becomeReplicate()
+	} else if r.state == remoteSnapshot {
+		if r.match >= r.snapshotIndex {
+			r.becomeRetry()
 		}
 	}
 }
 
-// 处理远程节点拒绝日志请求的情况，调整next，重试
-//   - rejected: 被拒绝的日志索引（远程节点未接受该索引的日志）
-//   - last: 远程节点的最新已知日志索引
-//
-// 返回值：true 若 next 索引被成功调整；false 若请求过时（rejected 已小于等于 match）。
 func (r *remote) decreaseTo(rejected uint64, last uint64) bool {
-
 	if r.state == remoteReplicate {
 		if rejected <= r.match {
-			// stale msg 过时消息
+			// stale msg
 			return false
 		}
-		//rejected > r.match 消息未过时
-		r.next = r.match + 1 //更新下一个日志索引
+		r.next = r.match + 1
 		return true
 	}
-	if r.next-1 != rejected { //检查rejected是否是最新请求
-		// stale 过时
+	if r.next-1 != rejected {
+		// stale
 		return false
 	}
-
-	r.waitToRetry() //若此时等待，则进入重试
-
-	// 下一个待接收的日志索引 next
-	// 可能是被拒绝的日志索引rejected
-	// 可能是当前最新日志索引last+1
-	//为了避免中间的日志被跳过，取min
-	// 可能是1（默认状态）
-
+	r.waitToRetry()
 	r.next = max(1, min(rejected, last+1))
 	return true
 }
 
-//-------------------状态查询与活性管理方法-------------------
-
-// 判断远程节点的复制是否处于暂停状态（Wait 或 Snapshot 状态下暂停主动复制）。
 func (r *remote) isPaused() bool {
 	switch r.state {
 	case remoteRetry:

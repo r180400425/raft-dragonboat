@@ -28,27 +28,22 @@ This document is an overview of the dragonboat library, it is in Chinese. The En
 
 ## 术语 ##
 
-Raft组：Raft协议控制下的一个独立的具有多个副本的实体，组内各个副本提供上一节中描述的一致性保证。一个应用可以使用管理一个或者多个Raft组。每个Raft组由一个系统内全局唯一的用户设定的64位整形数**ShardID**来指代。
-
+Raft组：Raft协议控制下的一个独立的具有多个副本的实体，组内各个副本提供上一节中描述的一致性保证。一个应用可以使用管理一个或者多个Raft组。每个Raft组由一个系统内全局唯一的用户设定的64位整形数ShardID来指代。
 集群Shard：Raft组的别称。
-
-节点Node：Raft组中的一个成员副本。每个节点由一个Raft组内唯一的用户设定的64位整形数**ReplicaID**来指代。
-
+节点Node：Raft组中的一个成员副本。每个节点由一个Raft组内唯一的用户设定的64位整形数ReplicaID来指代。
 初始成员节点Initial Member：一个Raft组在最初出现的时候所设定的原始成员。
-
 Leader：Raft协议中定义的扮演Leader角色的节点。每个Raft组应有一个Leader节点，只有当Leader节点确定时才能对该Raft组进行读写。
-
 快照Snapshot：把状态机在某具体时间点上的状态完全保存所得到的数据，可用于快速恢复状态机状态。
 
 ## 状态机 ##
 
-状态机是用户应用的核心，它实现用户的业务逻辑，比如当您想构建类似Redis的基于内存的Key-Value数据库，那您的状态机就是这样一个KV数据库。状态机同时也是用户应用与Dragonboat一大交互接口，Dragonboat库通过状态机所实现的**IStateMachine或IOnDiskStateMachine接口**与之交互，完成状态机状态更新与查询等操作。
+状态机是用户应用的核心，它实现用户的业务逻辑，比如当您想构建类似Redis的基于内存的Key-Value数据库，那您的状态机就是这样一个KV数据库。状态机同时也是用户应用与Dragonboat一大交互接口，Dragonboat库通过状态机所实现的IStateMachine或IOnDiskStateMachine接口与之交互，完成状态机状态更新与查询等操作。
 
 ### 普通状态机IStateMachine ###
 
-普通状态机通常将数据存放于内存内，这决定了其总的数据量相对较小。普通状态机的状态会在每次节点重启后被完全重置，其管理下的存储于磁盘上的数据也需要清理并忽略，然后通过**已持久化保存的Log和快照Snapshot**给予恢复。它的特点是数据量受限于内存大小、实现简单、吞吐可达千万次每秒，但定期的保存快照Snapshot以及每次重启后重建状态所带来额外的CPU、IO以及磁盘空间损耗较大。较常见的此类状态机的例子是类似Redis的基于内存的Key-Value数据库。此类型状态机是Raft论文中提及的**通常**类型的状态机。
+普通状态机通常将数据存放于内存内，这决定了其总的数据量相对较小。普通状态机的状态会在每次节点重启后被完全重置，其管理下的存储于磁盘上的数据也需要清理并忽略，然后通过已持久化保存的Log和快照Snapshot给予恢复。它的特点是数据量受限于内存大小、实现简单、吞吐可达千万次每秒，但定期的保存快照Snapshot以及每次重启后重建状态所带来额外的CPU、IO以及磁盘空间损耗较大。较常见的此类状态机的例子是类似Redis的基于内存的Key-Value数据库。此类型状态机是Raft论文中提及的通常类型的状态机。
 
-用户需要实现**statemachine包中的IStateMachine接口**以实现这类普通状态机。此类状态机状态在每次重启后应确保其初始状态为空，Dragonboat负责通过状态机的**Update与RecoverFromSnapshot**两个方法来恢复状态机的状态。请注意，普通状态机的状态在重启后被重置，但没有任何数据会被丢失，已持久保存的快照Snapshot和Raft Log包含所有已被采纳的用户数据。
+用户需要实现statemachine包中的IStateMachine接口以实现这类普通状态机。此类状态机状态在每次重启后应确保其初始状态为空，Dragonboat负责通过状态机的Update与RecoverFromSnapshot两个方法来恢复状态机的状态。请注意，普通状态机的状态在重启后被重置，但没有任何数据会被丢失，已持久保存的快照Snapshot和Raft Log包含所有已被采纳的用户数据。
 
 ### 基于磁盘的状态机IOnDiskStateMachine ###
 
@@ -70,33 +65,33 @@ Leader：Raft协议中定义的扮演Leader角色的节点。每个Raft组应有
 
 ## 节点停止 ##
 
-用户可以通过**NodeHost**的**StopShard**方法来停止所指定的Raft shard在该NodeHost管理下的副本。停止后的节点不再响应读写请求，但可以通过上述节点启动方式再次重新启动。
+用户可以通过NodeHost的StopShard方法来停止所指定的Raft shard在该NodeHost管理下的副本。停止后的节点不再响应读写请求，但可以通过上述节点启动方式再次重新启动。
 
 在一个副本被StopShard要求停止后，如果它正在执行快照的创建或恢复，该节点可能不会立刻停止而需等待至快照的创建或恢复完成。为避免这种长期等待，由用户实现的快照创建与恢复方法提供了一个<-chan struct{}的参数，当节点被要求停止后，该<-chan struct{}会被关闭，用户的快照创建与恢复方法可据此选择是否放弃当前的快照创建与恢复，从而快速响应节点停止的请求。
 
 ## 写操作 ##
 
-对状态机的写操作称为提议Propose。用户可以通过使用NodeHost的**Propose与SyncPropose**方法发起异步或者同步的提议。
+对状态机的写操作称为提议Propose。用户可以通过使用NodeHost的Propose与SyncPropose方法发起异步或者同步的提议。
 
-前述的共识算法常识可知，一个Raft组的过半数成员在线且可以互相正常交换网络消息，此时用户的提议才可以成为被采纳状态（**committed**）最终被送至各状态机的副本执行。Dragonboat通过向状态机接口的**Update**方法提供已采纳的提议，供状态机依次执行。
+前述的共识算法常识可知，一个Raft组的过半数成员在线且可以互相正常交换网络消息，此时用户的提议才可以成为被采纳状态（committed）最终被送至各状态机的副本执行。Dragonboat通过向状态机接口的Update方法提供已采纳的提议，供状态机依次执行。
 
-NodeHost的**Propose**方法开始一个异步的提议，它会立刻返回。如果发起成功它会提供一个RequestState对象，用户可以通过它等待提议的操作结果并获取结果状态。一个被成功开始的提议的可能结果有成功、超时和失败。成功表示提议被采纳且已经被应用到当前的节点Node中，此后所有开始的读操作均将可以读到该提议的执行结果或者更新的结果。超时表示在用户指定的时间内无法完成提议的整个流程，提议状态未明，这是典型的分布式系统中的三态情况。失败是指向Propose提供的参数不合理或节点在提议流程完成前已经被关闭。
+NodeHost的Propose方法开始一个异步的提议，它会立刻返回。如果发起成功它会提供一个RequestState对象，用户可以通过它等待提议的操作结果并获取结果状态。一个被成功开始的提议的可能结果有成功、超时和失败。成功表示提议被采纳且已经被应用当当前的节点Node中，此后所有开始的读操作均将可以读到该提议的执行结果或者更新的结果。超时表示在用户指定的时间内无法完成提议的整个流程，提议状态未明，这是典型的分布式系统中的三态情况。失败是指向Propose提供的参数不合理或节点在提议流程完成前已经被关闭。
 
-NodeHost的**SyncPropose**方法开始一个同步的提议，调用者的Goroutine会被挂起直到SyncPropose返回了明确成功、超时或者错误结果才会返回。它目前是对Propose方法的一个封装，可查看源代码比较两者实现的区别。
+NodeHost的SyncPropose方法开始一个同步的提议，调用者的Goroutine会被挂起直到SyncPropose返回了明确成功、超时或者错误结果才会返回。它目前是对Propose方法的一个封装，可查看源代码比较两者实现的区别。
 
-因为写操作超时以后导致上述三态情况，当用户重试一个超时的写请求的时候需要充分考虑这一情况，确保之前超时的操作如果已经成功执行了写操作，那么再次重试的写操作的再次执行不会对系统带来负面干扰，这样的特性称为**幂等**。显然，用户可以选择在状态机的设计上实现自己的幂等处理的方法。用户同时也可以选择使用Dragonboat自带的针对普通状态机的幂等方案，该方案基于Raft论文。
+因为写操作超时以后导致上述三态情况，当用户重试一个超时的写请求的时候需要充分考虑这一情况，确保之前超时的操作如果已经成功执行了写操作，那么再次重试的写操作的再次执行不会对系统带来负面干扰，这样的特性称为幂等。显然，用户可以选择在状态机的设计上实现自己的幂等处理的方法。用户同时也可以选择使用Dragonboat自带的针对普通状态机的幂等方案，该方案基于Raft论文。
 
-简单来说，Propose与SyncPropose方法均需要一个称为Session的输入参数，它是一个客户端访问状态进行写的Session。当用户选择不使用Dragonboat内建的幂等功能的时候，可以使用通过**调用NodeHost的GetNoOPSession方法**获得一个NOOP Session，它仅用来指明写操作针对的Raft组的ShardID标示。如果选择使用**内建的幂等支持**，那可以使用**GetNewSession**以获取一个有效的具体Session对象，并在当前的client每次调用Propose或者SyncPropose方法时使用这个Session对象。当Propose或SyncPropose成功后，需要调用Session的ProposalCompleted方法，而Propose或SyncPropose超时后则不调用ProposalCompleted方法而直接再次调用Propose或SyncPropose来重试已超时的提议。
+简单来说，Propose与SyncPropose方法均需要一个称为Session的输入参数，它是一个客户端访问状态进行写的Session。当用户选择不使用Dragonboat内建的幂等功能的时候，可以使用通过调用NodeHost的GetNoOPSession方法获得一个NOOP Session，它仅用来指明写操作针对的Raft组的ShardID标示。如果选择使用内建的幂等支持，那可以使用GetNewSession以获取一个有效的具体Session对象，并在当前的client每次调用Propose或者SyncPropose方法时使用这个Session对象。当Propose或SyncPropose成功后，需要调用Session的ProposalCompleted方法，而Propose或SyncPropose超时后则不调用ProposalCompleted方法而直接再次调用Propose或SyncPropose来重试已超时的提议。
 
 基于磁盘的状态机不支持该内置的幂等功能，必须使用NOOP Session，如有需求，用户需自行在状态机内实现其幂等的支持。
 
-写操作的**用户输入数据**应该是状态机执行更新操作的**唯一输入数据来源**，状态机在Update方法被调用以更新状态机状态时，不应该使用诸如系统时间、随机数、当前进程号等等在各个副本上不确定的数据源。
+写操作的用户输入数据应该是状态机执行更新操作的唯一输入数据来源，状态机在Update方法被调用以更新状态机状态时，不应该使用诸如系统时间、随机数、当前进程号等等在各个副本上不确定的数据源。
 
 默认设置下，一个Proposal只有在被确认已采纳且已成功应用于状态机时才会通知客户端，对部分有特殊需求的应用，可以通过设置NodeHostConfig的NotifyCommit参数使Dragonboat在Proposal被采纳后另行通知客户端。
 
 ## 读操作 ##
 
-对状态机的读操作通常用以查询状态机内容与状态，且读操作不改变状态机的状态。读操作必须采用确保一致性的协议，绝不可直接读取状态机内容。Dragonboat使用Raft论文中描述的称为**ReadIndex**的协议来实现高效的确保一致性的读。用户可以使用NodeHost的SyncRead以或者ReadIndex与ReadLocalNode的组合方式，完成对状态机的读，前者为同步操作，后者为异步。
+对状态机的读操作通常用以查询状态机内容与状态，且读操作不改变状态机的状态。读操作必须采用确保一致性的协议，绝不可直接读取状态机内容。Dragonboat使用Raft论文中描述的称为ReadIndex的协议来实现高效的确保一致性的读。用户可以使用NodeHost的SyncRead以或者ReadIndex与ReadLocalNode的组合方式，完成对状态机的读，前者为同步操作，后者为异步。
 
 与写操作类似，读操作所依赖的ReadIndex协议的顺利执行需要一个Raft组的过半数成员在线且可以互相正常交换网络消息。Dragonboat通过向状态机接口的Lookup方法提供用户查询内容，执行后返回查询结果。
 
@@ -154,49 +149,22 @@ NodeHost同时提供名为StaleRead的函数，如它的方法名称所表述的
 * 对于普通状态机，建议一天保存1-2次快照
 * 对于基于磁盘的状态机，建议每小时保存一次快照
 
-用户也可以使用NodeHost的**RequestSnapshot**方法对指定的Raft组请求创建快照。使用DefaultSnapshotOption所创建的快照就是一个普通快照，它由系统管理。如果讲SnapshotOption的Exported值设为true，那么所创建的快照会被导出到ExportPath所指向的目录，导出后的快照可备份后未来被用于修复已永久丢失多数节点的Raft组，导出至上述指定目录的快照由用户完全负责保存、转移和释放清理，系统不再干预。对于所请求的非导出的快照，用户同时可以通过SnapshotOption的OverrideCompactionOverhead和CompactionOverhead值来控制每次请求的快照产生以后多少已在快照中包含的Log需要被清理以释放磁盘空间。
+用户也可以使用NodeHost的RequestSnapshot方法对指定的Raft组请求创建快照。使用DefaultSnapshotOption所创建的快照就是一个普通快照，它由系统管理。如果讲SnapshotOption的Exported值设为true，那么所创建的快照会被导出到ExportPath所指向的目录，导出后的快照可备份后未来被用于修复已永久丢失多数节点的Raft组，导出至上述指定目录的快照由用户完全负责保存、转移和释放清理，系统不再干预。对于所请求的非导出的快照，用户同时可以通过SnapshotOption的OverrideCompactionOverhead和CompactionOverhead值来控制每次请求的快照产生以后多少已在快照中包含的Log需要被清理以释放磁盘空间。
 
 上述导出的快照，可以在多数节点均永久失效以后通过tools包提供的ImportSnapshot方法被用来修复已无法使用的Raft组。此时因为Raft组的多数节点已经永久失效，数据已有丢失，该操作为数据有损操作。用户程序应该通过设置合理的副本数以及加强服务器监控维护，通过避免发生多数节点永久失效来规避数据丢失问题。请注意，多数节点发生可恢复的失效，比如多数节点发生重启或短暂网络故障，并不会引起已保存数据的丢失。多数节点永久失效是指多数服务器上的磁盘损坏或服务器永久不再可用等故障。ImportSnapshot具体使用请参考其godoc文档。
 
 ## Gossip ##
 
-默认下，每个Raft组的每个副本在被加入系统时都由**用户**明确指定它所在的节点的**RaftAddress**位置，系统以此确保各类Raft消息可以被正确发送给该副本。该方案简单直接，但缺点是RaftAddress必须是固定不变的，这要求使用固定的IP或者由用户维护一个DNS Name。在这一要求无法满足时，可以使用**gossip**功能来规避这一问题。
+默认下，每个Raft组的每个副本在被加入系统时都由用户明确指定它所在的节点的RaftAddress位置，系统以此确保各类Raft消息可以被正确发送给该副本。该方案简单直接，但缺点是RaftAddress必须是固定不变的，这要求使用固定的IP或者由用户维护一个DNS Name。在这一要求无法满足时，可以使用gossip功能来规避这一问题。
 
-从v3.3版本开始，每个**NodeHost节点**都会被**随机**分配一个永久固定**不变**的**NodeHostID**值，它的值如nhid-1234567890形式，该值可由NodeHost的ID方法返回。在NodeHostConfig的DefaultNodeRegistryEnabled项被设置为真后，所有新创建的副本都需要被指定其对应的NodeHostID值。此后，每次启动NodeHost实例时用于NodeHost间通讯的RaftAddress值可随意变化，每个NodeHost实例的RaftAddress与NodeHostID的对应关系将自动由后台的一个gossip服务来动态的维护，当Raft消息需要在两个副本间传递时，首先发生ReplicaID到NodeHostID的转换，接着由NodeHostID通过gossip服务查询得到对应的RaftAddress地址并完成消息副本间的传输。
+从v3.3版本开始，每个NodeHost节点都会被随机分配一个永久固定不变的NodeHostID值，它的值如nhid-1234567890形式，该值可由NodeHost的ID方法返回。在NodeHostConfig的DefaultNodeRegistryEnabled项被设置为真后，所有新创建的副本都需要被指定其对应的NodeHostID值。此后，每次启动NodeHost实例时用于NodeHost间通讯的RaftAddress值可随意变化，每个NodeHost实例的RaftAddress与NodeHostID的对应关系将自动由后台的一个gossip服务来动态的维护，当Raft消息需要在两个副本间传递时，首先发生ReplicaID到NodeHostID的转换，接着由NodeHostID通过gossip服务查询得到对应的RaftAddress地址并完成消息副本间的传输。
 
 Gossip服务本身是一个全分布的网络服务，用户仅需要通过NodeHostConfig.Gossip项简单设置其相关地址参数即可。
-
-
-
-### 解释 ###
-就是固定地址和动态映射的关系，类似物理地址和虚拟地址
-
-启用Gossip时，NodeHostID固定，作为标识，RaftAddress可动态变化，其与NodeHostID的对应关系由Gossip服务自动维护。
-
-| 默认RaftAddress方式 | Gossip动态地址方式 |
-|--------------------------------------|----------------------------------------|
-| 依赖用户指定固定RaftAddress（IP/DNS） | 依赖永久NodeHostID + Gossip动态解析地址 |
-| 地址变更会导致副本失联 | 地址变更由Gossip自动同步，不影响可用性 |
-| 适用于静态网络环境（固定IP/物理机） | 适用于动态网络环境（云服务器/弹性IP） |
-
-
-| 概念 | 本质 | 标识 | 作用范围 |
-|------------|--------------------|--------------------|------------------------|
-| 副本（Replica） | 数据冗余单元（数据拷贝实例） | ReplicaID（组内唯一） | Raft组内 |
-| 节点（Node） | 副本的代码实例 | 同ReplicaID | Raft组内 |
-| 服务器（Server）| 物理/虚拟硬件宿主 | IP/主机名 | 承载多个NodeHost/节点 |
-
-节点是副本在代码层面的具体实现，是Raft组的成员。文档明确说明：“节点Node：Raft组中的一个成员副本”，即节点 ≈ 副本，是同一概念的不同表述（“节点”更侧重代码层面的实例，“副本”更侧重数据冗余的逻辑概念）。
-
-节点由 NodeHost 组件管理，每个NodeHost可以运行多个节点（属于不同Raft组）。
-
-通过这种层级关系，Dragonboat实现了“多副本跨服务器部署”，从而保证分布式系统的高可用和数据一致性。
-
 
 ## 其它功能 ##
 
 Dragonboat通过NodeHost提供下列其它常用功能：
 
-* Non-Voting节点。观察者节点不参与Leader的选举，不参与一个提议是否可以被采纳，它仅仅用来接受并执行Raft组各个已采纳的提议。观察者节点的状态机与普通节点一样，正常情况下将具备完整且相同的状态机状态，它可以被用来做为一个额外的只读节点，供用户读取有一致性保证的状态机状态。观察者节点的另一大作用是**允许一个新加入的节点以观察者身份加入Raft组，在其逐渐获取所有状态机状态后再提升其为正常节点**。在观察者节点所在的NodeHost上发起一次SyncRead或者一次GetShardMembership，如果成功返回则表示ReadIndex协议被完整执行了一轮，这表示观察者节点已经拥有基本所有Log Entry，具备了将其升级为正常节点的条件。
+* Non-Voting节点。观察者节点不参与Leader的选举，不参与一个提议是否可以被采纳，它仅仅用来接受并执行Raft组各个已采纳的提议。观察者节点的状态机与普通节点一样，正常情况下将具备完整且相同的状态机状态，它可以被用来做为一个额外的只读节点，供用户读取有一致性保证的状态机状态。观察者节点的另一大作用是允许一个新加入的节点以观察者身份加入Raft组，在其逐渐获取所有状态机状态后再提升其为正常节点。在观察者节点所在的NodeHost上发起一次SyncRead或者一次GetShardMembership，如果成功返回则表示ReadIndex协议被完整执行了一轮，这表示观察者节点已经拥有基本所有Log Entry，具备了将其升级为正常节点的条件。
 * Leader迁移。正常情况下，Leader以选举方式由用户程序透明的方式选举产生。用户可以使用NodeHost提供的RequestLeaderTransfer方法尝试将Leader迁移至指定节点。
 * NodeHost同时提供GetNodeHostInfo与GetShardMembership方法供查询当前各NodeHost管理下的各Raft组信息。

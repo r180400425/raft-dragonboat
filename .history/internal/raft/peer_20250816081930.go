@@ -167,133 +167,95 @@ func (p *Peer) ProposeConfigChange(cc pb.ConfigChange, key uint64) error {
 	return p.raft.Handle(pb.Message{
 		Type:    pb.Propose,                                                    // 提案消息类型
 		Entries: []pb.Entry{{Type: pb.ConfigChangeEntry, Cmd: data, Key: key}}, // 构造配置变更条目
-		// 包括（条目类型，序列化的配置变更数据，提案唯一标识）
-
+		// 包括
 	})
 }
 
-// ApplyConfigChange 将配置变更应用到本地 Raft 节点
 // ApplyConfigChange applies a raft membership change to the local raft node.
-func (p *Peer) ApplyConfigChange(cc pb.ConfigChange) error { // 参数 cc: 配置变更信息（由领导者提议并提交）
-	// 若 ReplicaID 为 NoLeader，清除待处理的配置变更（异常情况）
+func (p *Peer) ApplyConfigChange(cc pb.ConfigChange) error {
 	if cc.ReplicaID == NoLeader {
 		p.raft.clearPendingConfigChange()
 		return nil
 	}
-	// 发送 ConfigChangeEvent 消息，通知 raft 应用配置变更
 	return p.raft.Handle(pb.Message{
-		Type:     pb.ConfigChangeEvent, // 配置变更事件类型
-		Reject:   false,                // 不拒绝（应用变更）
-		Hint:     cc.ReplicaID,         // 目标节点副本 ID
-		HintHigh: uint64(cc.Type),      // 配置变更类型（如添加/移除节点）
+		Type:     pb.ConfigChangeEvent,
+		Reject:   false,
+		Hint:     cc.ReplicaID,
+		HintHigh: uint64(cc.Type),
 	})
 }
 
-// RejectConfigChange 拒绝当前待处理的 Raft 配置变更
 // RejectConfigChange rejects the currently pending raft membership change.
 func (p *Peer) RejectConfigChange() error {
-	// 发送 ConfigChangeEvent 消息，通知 raft 拒绝配置变更
 	return p.raft.Handle(pb.Message{
-		Type:   pb.ConfigChangeEvent, // 配置变更事件类型
-		Reject: true,                 // 拒绝变更
+		Type:   pb.ConfigChangeEvent,
+		Reject: true,
 	})
 }
 
-// RestoreRemotes 从快照中恢复远程节点信息（如节点地址、状态等）
 // RestoreRemotes applies the remotes info obtained from the specified snapshot.
-func (p *Peer) RestoreRemotes(ss pb.Snapshot) error { // 参数 ss: 快照数据（包含远程节点信息）
-	// 发送 SnapshotReceived 消息，通知 raft 处理快照恢复
+func (p *Peer) RestoreRemotes(ss pb.Snapshot) error {
 	return p.raft.Handle(pb.Message{
-		Type:     pb.SnapshotReceived, // 快照接收消息类型
-		Snapshot: ss,                  // 快照数据
+		Type:     pb.SnapshotReceived,
+		Snapshot: ss,
 	})
 }
 
-// ReportUnreachableNode 标记指定节点为不可达
 // ReportUnreachableNode marks the specified node as not reachable.
-func (p *Peer) ReportUnreachableNode(replicaID uint64) error { // 参数 replicaID: 不可达节点的副本 ID
-	// 发送 Unreachable 消息，通知 raft 节点不可达
+func (p *Peer) ReportUnreachableNode(replicaID uint64) error {
 	return p.raft.Handle(pb.Message{
-		Type: pb.Unreachable, // 节点不可达消息类型
-		From: replicaID,      // 不可达节点的副本 ID
+		Type: pb.Unreachable,
+		From: replicaID,
 	})
 }
 
-// ReportSnapshotStatus 向本地 Raft 节点报告快照发送/接收状态
-// 参数说明：
-//   - replicaID: 目标节点副本 ID
-//   - reject: 快照是否被拒绝（true 表示拒绝，false 表示成功）
-//
-// ReportSnapshotStatus reports the status of the snapshot to the local raft node.
+// ReportSnapshotStatus reports the status of the snapshot to the local raft
+// node.
 func (p *Peer) ReportSnapshotStatus(replicaID uint64, reject bool) error {
-	// 发送 SnapshotStatus 消息，通知 raft 快照状态
 	return p.raft.Handle(pb.Message{
-		Type:   pb.SnapshotStatus, // 快照状态消息类型
-		From:   replicaID,         // 目标节点副本 ID
-		Reject: reject,            // 快照是否被拒绝
+		Type:   pb.SnapshotStatus,
+		From:   replicaID,
+		Reject: reject,
 	})
 }
 
-// Handle 处理外部（非本地）消息（如来自其他节点的投票请求、日志复制等）
 // Handle processes the given message.
-func (p *Peer) Handle(m pb.Message) error { // 参数 m: 待处理的 Raft 消息
-	// 本地消息（如 LocalTick）不应通过此接口处理，直接 panic
+func (p *Peer) Handle(m pb.Message) error {
 	if IsLocalMessageType(m.Type) {
 		panic("local message sent to Step")
 	}
-	// 检查发送者是否为已知节点：远程节点、非投票节点或见证节点
-	_, rok := p.raft.remotes[m.From]    // 远程节点（投票成员）
-	_, ook := p.raft.nonVotings[m.From] // 非投票节点（仅同步日志）
-	_, wok := p.raft.witnesses[m.From]  // 见证节点（仅参与法定人数）
-	// 若为已知节点或非响应类消息，交给 raft 处理
+	_, rok := p.raft.remotes[m.From]
+	_, ook := p.raft.nonVotings[m.From]
+	_, wok := p.raft.witnesses[m.From]
 	if rok || ook || wok || !isResponseMessageType(m.Type) {
 		return p.raft.Handle(m)
 	}
-	// 未知节点的响应消息，忽略（返回 nil）
 	return nil
 }
 
-// GetUpdate 获取 Peer 的当前状态更新（包含待处理日志、消息、状态变更等）
-// 参数说明：
-//   - moreToApply: 是否有更多待应用的日志条目
-//   - lastApplied: 最后一个已应用的日志索引（来自上层状态机）
-//
-// 返回值：pb.Update 结构体（包含所有待处理的更新信息）
 // GetUpdate returns the current state of the Peer.
 func (p *Peer) GetUpdate(moreToApply bool,
 	lastApplied uint64) (pb.Update, error) {
-
-	// 构建基础更新信息
 	ud, err := p.getUpdate(moreToApply, lastApplied)
 	if err != nil {
-		return pb.Update{}, err // 错误处理
+		return pb.Update{}, err
 	}
-	// 验证更新信息合法性（如已提交条目是否已保存）
 	validateUpdate(ud)
-	// 设置 FastApply 标志（优化：是否可跳过持久化直接应用）
 	ud = setFastApply(ud)
-	// 构建 UpdateCommit 字段（记录需要持久化的状态）
 	ud.UpdateCommit = getUpdateCommit(ud)
 	return ud, nil
 }
 
-// setFastApply 设置 Update 的 FastApply 标志（是否支持快速应用）
-// 逻辑：若存在快照或已应用条目未完全持久化，则不可快速应用
 func setFastApply(ud pb.Update) pb.Update {
-	ud.FastApply = true // 默认支持快速应用
-	// 若存在快照，需先持久化快照，不可快速应用
+	ud.FastApply = true
 	if !pb.IsEmptySnapshot(ud.Snapshot) {
 		ud.FastApply = false
 	}
-	// 若支持快速应用，进一步检查已应用条目是否在待保存范围内
 	if ud.FastApply {
 		if len(ud.CommittedEntries) > 0 && len(ud.EntriesToSave) > 0 {
-
 			lastApplyIndex := ud.CommittedEntries[len(ud.CommittedEntries)-1].Index
 			lastSaveIndex := ud.EntriesToSave[len(ud.EntriesToSave)-1].Index
 			firstSaveIndex := ud.EntriesToSave[0].Index
-
-			// 若已应用条目在待保存范围内（未完全持久化），不可快速应用
 			if lastApplyIndex >= firstSaveIndex && lastApplyIndex <= lastSaveIndex {
 				ud.FastApply = false
 			}
@@ -302,22 +264,17 @@ func setFastApply(ud pb.Update) pb.Update {
 	return ud
 }
 
-// validateUpdate 验证 Update 信息的合法性（防止应用未持久化或未提交的条目）
 func validateUpdate(ud pb.Update) {
-	// 检查已提交条目是否超过提交索引（防止应用未提交条目）
 	if ud.Commit > 0 && len(ud.CommittedEntries) > 0 {
 		lastIndex := ud.CommittedEntries[len(ud.CommittedEntries)-1].Index
-
 		if lastIndex > ud.Commit {
 			plog.Panicf("trying to apply not committed entry: %d, %d",
 				ud.Commit, lastIndex)
 		}
 	}
-	// 检查已应用条目是否超过已保存条目（防止应用未持久化条目）
 	if len(ud.CommittedEntries) > 0 && len(ud.EntriesToSave) > 0 {
 		lastApply := ud.CommittedEntries[len(ud.CommittedEntries)-1].Index
 		lastSave := ud.EntriesToSave[len(ud.EntriesToSave)-1].Index
-
 		if lastApply > lastSave {
 			plog.Panicf("trying to apply not saved entry: %d, %d",
 				lastApply, lastSave)
@@ -325,194 +282,149 @@ func validateUpdate(ud pb.Update) {
 	}
 }
 
-// RateLimited 返回 Raft 节点是否被限流（如网络带宽限制）
-// RateLimited returns a boolean flag indicating whether the Raft node is rate limited.
+// RateLimited returns a boolean flag indicating whether the Raft node is rate
+// limited.
 func (p *Peer) RateLimited() bool {
-	return p.raft.rl.RateLimited() // 委托给 raft 的限流控制器
+	return p.raft.rl.RateLimited()
 }
 
-// HasUpdate 判断是否有更新需要处理（如待保存日志、消息、状态变更等）
-// 参数 moreToApply: 是否有更多待应用的日志条目
 // HasUpdate returns a boolean value indicating whether there is any Update
 // ready to be processed.
 func (p *Peer) HasUpdate(moreToApply bool) bool {
 	r := p.raft
-	// 以下任一条件满足则有更新：
-	// 1. 有日志条目待保存到日志数据库
 	if len(r.log.entriesToSave()) > 0 {
 		return true
 	}
-	// 2. 有日志查询结果待返回
 	if r.logQueryResult != nil {
 		return true
 	}
-	// 3. 有领导者状态更新（如任期、领导者 ID 变更）
 	if r.leaderUpdate != nil {
 		return true
 	}
-	// 4. 有消息待发送（如投票请求、日志复制请求）
 	if len(r.msgs) > 0 {
 		return true
 	}
-	// 5. 有待应用的日志条目且需要继续应用
 	if moreToApply && r.log.hasEntriesToApply() {
 		return true
 	}
-	// 6. Raft 状态发生变更（与 prevState 对比）
 	if pst := r.raftState(); !pb.IsEmptyState(pst) &&
 		!pb.IsStateEqual(pst, p.prevState) {
 		return true
 	}
-	// 7. 存在非空快照（待持久化或发送）
 	if r.log.inmem.snapshot != nil &&
 		!pb.IsEmptySnapshot(*r.log.inmem.snapshot) {
 		return true
 	}
-	// 8. 有读操作准备就绪（ReadIndex 结果）
 	if len(r.readyToRead) != 0 {
 		return true
 	}
-	// 9. 有丢弃的日志条目（如超过日志保留期限）
 	if len(r.droppedEntries) > 0 {
 		return true
 	}
-	// 10. 有丢弃的读索引请求（如超时）
 	if len(r.droppedReadIndexes) > 0 {
 		return true
 	}
-	// 无更新
 	return false
 }
 
-// Commit 提交 Update 状态（标记为已处理，清理资源）
-// 参数 ud: 已处理的 Update 结构体
 // Commit commits the Update state to mark it as processed.
 func (p *Peer) Commit(ud pb.Update) {
-	// 清理 raft 中的临时数据：
-	p.raft.msgs = nil               // 清空待发送消息队列
-	p.raft.logQueryResult = nil     // 清空日志查询结果
-	p.raft.leaderUpdate = nil       // 清空领导者更新
-	p.raft.droppedEntries = nil     // 清空丢弃的日志条目
-	p.raft.droppedReadIndexes = nil // 清空丢弃的读索引
-	// 更新 prevState（若状态不为空）
+	p.raft.msgs = nil
+	p.raft.logQueryResult = nil
+	p.raft.leaderUpdate = nil
+	p.raft.droppedEntries = nil
+	p.raft.droppedReadIndexes = nil
 	if !pb.IsEmptyState(ud.State) {
 		p.prevState = ud.State
 	}
-	// 若有读操作就绪，清除 readyToRead
 	if ud.UpdateCommit.ReadyToRead > 0 {
 		p.raft.clearReadyToRead()
 	}
-	// 通知日志模块提交更新（持久化状态）
 	p.entryLog().commitUpdate(ud.UpdateCommit)
 }
 
-// ReadIndex 启动 ReadIndex 操作（实现线性一致性读，Raft 论文 6.4 节）
-// 参数 ctx: 系统上下文（包含 Low 和 High 字段，用于标识请求）
-// ReadIndex starts a ReadIndex operation. The ReadIndex protocol is defined in the section 6.4 of the Raft thesis.
+// ReadIndex starts a ReadIndex operation. The ReadIndex protocol is defined in
+// the section 6.4 of the Raft thesis.
 func (p *Peer) ReadIndex(ctx pb.SystemCtx) error {
-	// 发送 ReadIndex 消息，触发读索引协议
 	return p.raft.Handle(pb.Message{
-		Type:     pb.ReadIndex, // 读索引消息类型
-		Hint:     ctx.Low,      // 上下文 Low 值
-		HintHigh: ctx.High,     // 上下文 High 值
+		Type:     pb.ReadIndex,
+		Hint:     ctx.Low,
+		HintHigh: ctx.High,
 	})
 }
 
-// NotifyRaftLastApplied 通知 Raft 最后应用的日志索引（来自上层状态机）
-// 参数 lastApplied: 上层状态机已应用的最后一个日志索引
 // NotifyRaftLastApplied passes on the lastApplied index confirmed by the RSM to
 // the raft state machine.
 func (p *Peer) NotifyRaftLastApplied(lastApplied uint64) {
-	p.raft.setApplied(lastApplied) // 设置 raft 的 applied 字段
+	p.raft.setApplied(lastApplied)
 }
 
-// HasEntryToApply 判断是否有更多待应用的日志条目
 // HasEntryToApply returns a boolean flag indicating whether there are more
 // entries ready to be applied.
 func (p *Peer) HasEntryToApply() bool {
-	return p.entryLog().hasEntriesToApply() // 委托给日志模块
+	return p.entryLog().hasEntriesToApply()
 }
 
-// entryLog 返回 raft 的日志模块实例（辅助函数）
 func (p *Peer) entryLog() *entryLog {
 	return p.raft.log
 }
 
-// getUpdate 构建基础的 Update 结构体（包含待处理的日志、消息、状态等）
-// 参数说明：
-//   - moreToApply: 是否有更多待应用的日志条目
-//   - lastApplied: 最后一个已应用的日志索引
 func (p *Peer) getUpdate(moreToApply bool,
 	lastApplied uint64) (pb.Update, error) {
-	// 初始化 Update 结构体，填充基础信息
 	ud := pb.Update{
-		ShardID:       p.raft.shardID,               // 分片 ID
-		ReplicaID:     p.raft.replicaID,             // 副本 ID
-		EntriesToSave: p.entryLog().entriesToSave(), // 待保存到日志数据库的条目
-		Messages:      p.raft.msgs,                  // 待发送的消息列表
-		LastApplied:   lastApplied,                  // 最后已应用索引（来自上层）
-		FastApply:     true,                         // 默认支持快速应用
+		ShardID:       p.raft.shardID,
+		ReplicaID:     p.raft.replicaID,
+		EntriesToSave: p.entryLog().entriesToSave(),
+		Messages:      p.raft.msgs,
+		LastApplied:   lastApplied,
+		FastApply:     true,
 	}
-	// 填充日志查询结果（若存在）
 	if p.raft.logQueryResult != nil {
 		ud.LogQueryResult = *p.raft.logQueryResult
 	}
-	// 填充领导者更新（若存在）
 	if p.raft.leaderUpdate != nil {
 		ud.LeaderUpdate = *p.raft.leaderUpdate
 	}
-	// 为所有消息设置分片 ID（确保路由正确）
 	for idx := range ud.Messages {
 		ud.Messages[idx].ShardID = p.raft.shardID
 	}
-	// 若需要继续应用，填充待应用的已提交条目
 	if moreToApply {
 		toApply, err := p.entryLog().entriesToApply()
 		if err != nil {
-			return pb.Update{}, err // 错误处理
+			return pb.Update{}, err
 		}
 		ud.CommittedEntries = toApply
 	}
-	// 若有待应用条目，判断是否还有更多条目（用于分页处理）
 	if len(ud.CommittedEntries) > 0 {
 		lastIndex := ud.CommittedEntries[len(ud.CommittedEntries)-1].Index
 		ud.MoreCommittedEntries = p.entryLog().hasMoreEntriesToApply(lastIndex)
 	}
-	// 若 Raft 状态变更，填充状态信息
 	if pst := p.raft.raftState(); !pb.IsStateEqual(pst, p.prevState) {
 		ud.State = pst
 	}
-	// 若存在快照，填充快照信息
 	if p.entryLog().inmem.snapshot != nil {
 		ud.Snapshot = *p.entryLog().inmem.snapshot
 	}
-	// 填充读操作就绪列表
 	if len(p.raft.readyToRead) > 0 {
 		ud.ReadyToReads = p.raft.readyToRead
 	}
-	// 填充丢弃的日志条目
 	if len(p.raft.droppedEntries) > 0 {
 		ud.DroppedEntries = p.raft.droppedEntries
 	}
-	// 填充丢弃的读索引请求
 	if len(p.raft.droppedReadIndexes) > 0 {
 		ud.DroppedReadIndexes = p.raft.droppedReadIndexes
 	}
 	return ud, nil
 }
 
-// checkLaunchRequest 检查启动请求的合法性（防止无效配置）
 func checkLaunchRequest(config config.Config,
 	addresses []PeerAddress, initial bool, newNode bool) {
-	// 副本 ID 不能为 0（无效标识）
 	if config.ReplicaID == 0 {
 		panic("config.ReplicaID must not be zero")
 	}
-	// 初始集群且新节点时，地址列表不能为空（需指定初始成员）
 	if initial && newNode && len(addresses) == 0 {
 		panic("addresses must be specified")
 	}
-	// 检查地址列表是否有重复（确保节点地址唯一）
 	uniqueAddressList := make(map[string]struct{})
 	for _, addr := range addresses {
 		uniqueAddressList[addr.Address] = struct{}{}
@@ -520,71 +432,56 @@ func checkLaunchRequest(config config.Config,
 	if len(uniqueAddressList) != len(addresses) {
 		plog.Panicf("duplicated address found %v", addresses)
 	}
-	// 见证节点（witness）不能作为初始成员（不参与日志复制）
 	if initial && config.IsWitness {
 		plog.Panicf("witness can not be used as initial member")
 	}
-	// 非投票节点（non-voting）不能作为初始成员（不参与投票）
 	if initial && config.IsNonVoting {
 		plog.Panicf("non-voting can not be used as initial member")
 	}
 }
 
-// bootstrap 引导 Raft 集群（初始化初始成员配置）
-func bootstrap(r *raft, addresses []PeerAddress) { // 参数 r: raft 实例，addresses: 初始成员地址列表
-	// 按副本 ID 排序地址列表（确保一致性）
+func bootstrap(r *raft, addresses []PeerAddress) {
 	sort.Slice(addresses, func(i, j int) bool {
 		return addresses[i].ReplicaID < addresses[j].ReplicaID
 	})
-	// 为每个初始成员创建配置变更条目（AddNode 类型）
 	ents := make([]pb.Entry, len(addresses))
 	for i, peer := range addresses {
 		plog.Infof("%s added bootstrap ConfigChangeAddNode, %d, %s",
 			r.describe(), peer.ReplicaID, peer.Address)
-		// 构造配置变更：添加节点
 		cc := pb.ConfigChange{
-			Type:       pb.AddNode,     // 变更类型：添加节点
-			ReplicaID:  peer.ReplicaID, // 节点副本 ID
-			Initialize: true,           // 标记为初始化（首次启动）
-			Address:    peer.Address,   // 节点地址
+			Type:       pb.AddNode,
+			ReplicaID:  peer.ReplicaID,
+			Initialize: true,
+			Address:    peer.Address,
 		}
-		// 序列化配置变更并创建日志条目（任期 1，索引 i+1）
 		ents[i] = pb.Entry{
-			Type:  pb.ConfigChangeEntry, // 条目类型：配置变更
-			Term:  1,                    // 任期 1（初始任期）
-			Index: uint64(i + 1),        // 索引从 1 开始
-			Cmd:   pb.MustMarshal(&cc),  // 序列化的配置变更数据
+			Type:  pb.ConfigChangeEntry,
+			Term:  1,
+			Index: uint64(i + 1),
+			Cmd:   pb.MustMarshal(&cc),
 		}
 	}
-	// 将配置变更条目追加到日志
 	r.log.append(ents)
-	// 设置提交索引为最后一个配置变更条目的索引（初始集群直接提交）
 	r.log.committed = uint64(len(ents))
-	// 将初始成员添加到 raft 的远程节点列表（标记为投票成员）
 	for _, peer := range addresses {
 		r.addNode(peer.ReplicaID)
 	}
 }
 
-// getUpdateCommit 构建 UpdateCommit 结构体（记录需要持久化的状态）
 func getUpdateCommit(ud pb.Update) pb.UpdateCommit {
 	uc := pb.UpdateCommit{
-		ReadyToRead: uint64(len(ud.ReadyToReads)), // 读操作就绪数量
-		LastApplied: ud.LastApplied,               // 最后已应用索引
+		ReadyToRead: uint64(len(ud.ReadyToReads)),
+		LastApplied: ud.LastApplied,
 	}
-	// 若有待应用条目，记录最后一个条目的索引（已处理到该索引）
 	if len(ud.CommittedEntries) > 0 {
 		uc.Processed = ud.CommittedEntries[len(ud.CommittedEntries)-1].Index
 	}
-	// 若有待保存条目，记录最后一个条目的索引和任期（需持久化到日志）
 	if len(ud.EntriesToSave) > 0 {
 		lastEntry := ud.EntriesToSave[len(ud.EntriesToSave)-1]
 		uc.StableLogTo, uc.StableLogTerm = lastEntry.Index, lastEntry.Term
 	}
-	// 若存在快照，记录快照索引（需持久化快照）
 	if !pb.IsEmptySnapshot(ud.Snapshot) {
 		uc.StableSnapshotTo = ud.Snapshot.Index
-		// Processed 取已应用条目索引和快照索引的最大值
 		uc.Processed = max(uc.Processed, uc.StableSnapshotTo)
 	}
 	return uc

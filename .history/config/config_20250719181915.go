@@ -15,31 +15,29 @@
 /*
 Package config contains functions and types used for managing dragonboat's
 configurations.
-config包 包括函数和类型，用于管理dragonboat的配置
-提供核心配置管理功能，包括Raft节点配置 、NodeHost配置、相关常量定义。
 */
 package config
 
 import (
-	"crypto/tls"    // 用于TLS加密通信配置
-	"net"           // 网络地址处理
-	"path/filepath" // 文件路径处理
-	"reflect"       // 反射，用于配置验证
-	"strconv"       // 字符串转换
-	"time"          // 时间相关操作
+	"crypto/tls"
+	"net"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"time"
 
-	"github.com/cockroachdb/errors"     // 错误处理库，提供更丰富的错误信息
-	"github.com/lni/goutils/netutil"    // 网络工具函数，如地址验证、TLS配置
-	"github.com/lni/goutils/stringutil" // 字符串工具函数，如地址格式检查
+	"github.com/cockroachdb/errors"
+	"github.com/lni/goutils/netutil"
+	"github.com/lni/goutils/stringutil"
 
-	"github.com/lni/dragonboat/v4/internal/fileutil" // 内部文件操作工具
-	"github.com/lni/dragonboat/v4/internal/id"       // 内部ID生成与验证工具
-	"github.com/lni/dragonboat/v4/internal/settings" // 内部配置常量
-	"github.com/lni/dragonboat/v4/internal/vfs"      // 虚拟文件系统接口，用于测试与适配
-	"github.com/lni/dragonboat/v4/logger"            // 日志工具
-	"github.com/lni/dragonboat/v4/raftio"            // Raft IO接口定义
-	pb "github.com/lni/dragonboat/v4/raftpb"         // Raft协议相关的protobuf定义
-) //pb：自定义的包别名（alias），后续代码中可用 pb 代替原包名引用该包的类型、函数等。
+	"github.com/lni/dragonboat/v4/internal/fileutil"
+	"github.com/lni/dragonboat/v4/internal/id"
+	"github.com/lni/dragonboat/v4/internal/settings"
+	"github.com/lni/dragonboat/v4/internal/vfs"
+	"github.com/lni/dragonboat/v4/logger"
+	"github.com/lni/dragonboat/v4/raftio"
+	pb "github.com/lni/dragonboat/v4/raftpb"
+)
 
 var (
 	plog = logger.GetLogger("config")

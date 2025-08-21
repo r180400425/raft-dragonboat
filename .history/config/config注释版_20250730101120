@@ -42,16 +42,20 @@ import (
 ) //pb：自定义的包别名（alias），后续代码中可用 pb 代替原包名引用该包的类型、函数等。
 
 var (
+	// plog 是config包专用的日志实例，用于记录配置相关的日志信息
 	plog = logger.GetLogger("config")
 )
 
 const (
 	// don't change these, see the comments on ExpertConfig.
-	defaultExecShards  uint64 = 16
+
+	// defaultExecShards 是执行引擎第一阶段的默认分片数量，不可修改（详见ExpertConfig注释）
+	defaultExecShards uint64 = 16
+	// defaultLogDBShards 是LogDB存储引擎的默认分片数量，不可修改（详见ExpertConfig注释）
 	defaultLogDBShards uint64 = 16
 )
 
-// CompressionType is the type of the compression.
+// CompressionType is the type of the compression.数据压缩算法的类型
 type CompressionType = pb.CompressionType
 
 const (

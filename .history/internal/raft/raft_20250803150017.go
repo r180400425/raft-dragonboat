@@ -564,7 +564,8 @@ func (r *raft) describe() string {
 		r.log.committed,            // 已提交的日志索引（多数节点已复制）
 		r.log.processed,            // 已应用到状态机的日志索引（已执行）
 		dn(r.shardID, r.replicaID), // 节点标识（shardID:replicaID）
-		r.term)                     // 当前任期号
+		r.term,                     // 当前任期号
+	)
 }
 
 // 判断节点类型
@@ -1157,7 +1158,7 @@ func (r *raft) sendRateLimitMessage() {
 	})
 }
 
-// 创建 InstallSnapshot 消息，用于向目标节点发送快照。
+// makeInstallSnapshotMessage 创建 InstallSnapshot 消息，用于向目标节点发送快照。
 // 快照包含集群状态的完整备份，用于快速同步落后节点（避免逐条复制历史日志）。
 // 参数：
 //   - to: 目标节点 ID
@@ -1175,8 +1176,6 @@ func (r *raft) makeInstallSnapshotMessage(to uint64, m *pb.Message) uint64 {
 		plog.Panicf("%s got an empty snapshot", r.describe())
 	}
 
-	// For witness, snapshot message will be marked as dummy snapshot.
-
 	// 见证节点（Witness）仅需元数据快照（不含实际日志数据，节省带宽）
 	if _, ok := r.witnesses[to]; ok {
 		snapshot = makeWitnessSnapshot(snapshot)
@@ -1186,7 +1185,7 @@ func (r *raft) makeInstallSnapshotMessage(to uint64, m *pb.Message) uint64 {
 	return snapshot.Index // 返回快照的日志索引
 }
 
-// makeWitnessSnapshot 将完整快照转换为见证节点Witness专用的元数据快照。
+// makeWitnessSnapshot 将完整快照转换为见证节点专用的元数据快照。
 // 见证节点不存储完整日志和快照数据，仅需元数据（索引、任期、成员配置）参与法定人数计算。
 // 参数：
 //   - snapshot: 完整快照
@@ -1204,7 +1203,7 @@ func makeWitnessSnapshot(snapshot pb.Snapshot) pb.Snapshot {
 	return result
 }
 
-// 创建 Replicate 消息，包含待复制的日志条目，用于领导者向跟随者同步日志。
+// makeReplicateMessage 创建 Replicate 消息，包含待复制的日志条目，用于领导者向跟随者同步日志。
 // 根据目标节点类型（普通节点/见证节点）调整日志内容（见证节点仅需元数据条目）。
 // 参数：
 //   - to: 目标节点 ID
@@ -1214,14 +1213,13 @@ func makeWitnessSnapshot(snapshot pb.Snapshot) pb.Snapshot {
 // 返回值：
 //   - pb.Message: 构造的 Replicate 消息
 //   - error: 日志获取失败（如日志已压缩）
-func (r *raft) makeReplicateMessage(to uint64, next uint64, maxSize uint64) (pb.Message, error) {
-
+func (r *raft) makeReplicateMessage(to uint64,
+	next uint64, maxSize uint64) (pb.Message, error) {
 	// 获取 next-1 索引处日志的任期（用于日志一致性检查）
 	term, err := r.log.term(next - 1)
 	if err != nil {
 		return pb.Message{}, err
 	}
-
 	// 获取从 next 开始的日志条目（不超过 maxSize 大小）
 	entries, err := r.log.entries(next, maxSize)
 	if err != nil {
@@ -1238,18 +1236,10 @@ func (r *raft) makeReplicateMessage(to uint64, next uint64, maxSize uint64) (pb.
 		}
 	}
 
-	// 如果是witness节点，需要特殊处理
 	// 见证节点仅需元数据条目（不含命令数据，除非是配置变更条目）
-
-	// Don't send actual log entry to witness as they won't replicate real message,
-	// unless there is a config change.
-	if _, ok := r.witnesses[to]; ok { //通过查找to节点是否存在于witnessmap中，判断to是否是见证节点
+	if _, ok := r.witnesses[to]; ok {
 		entries = makeMetadataEntries(entries)
 	}
-	// 此句语法：
-	// 赋值操作：_, ok := r.witnesses[to]
-	// 条件判断：ok（布尔值）
-	// 只有当 ok 为 true 时，整个条件才为真，执行 if 块中的代码。
 
 	// 构造并返回 Replicate 消息
 	return pb.Message{
@@ -1306,31 +1296,25 @@ func (r *raft) sendReplicateMessage(to uint64) {
 	}
 
 	// 若节点复制进度暂停（如快照发送中），跳过本次复制
-	// （Wait 或 Snapshot 状态下暂停主动复制）。
 	if rp.isPaused() {
 		return
 	}
 
 	// 尝试创建 Replicate 消息（包含待复制日志条目）
 	m, err := r.makeReplicateMessage(to, rp.next, maxEntrySize)
-
-	if err != nil { // 日志获取失败，此时需要根据快照同步节点状态，恢复节点状态
-
-		if !rp.isActive() { //rp 非活动
+	if err != nil {
+		// 日志已压缩导致无法获取条目，需发送快照
+		if !rp.isActive() {
 			plog.Warningf("%s, %s is not active, sending snapshot is skipped",
 				r.describe(), ReplicaID(to))
 			return
 		}
-
-		// rp active
-
 		// 创建并发送快照消息
 		index := r.makeInstallSnapshotMessage(to, &m)
-		plog.Infof("%s is sending snapshot (%d) to %s, r.Next %d, r.Match %d, %v", r.describe(), index, ReplicaID(to), rp.next, rp.match, err)
+		plog.Infof("%s is sending snapshot (%d) to %s, r.Next %d, r.Match %d, %v",
+			r.describe(), index, ReplicaID(to), rp.next, rp.match, err)
 		rp.becomeSnapshot(index) // 标记节点为快照发送中状态
-
-	} else if len(m.Entries) > 0 { //获取到日志
-
+	} else if len(m.Entries) > 0 {
 		// 更新节点复制进度（已发送的最后一条日志索引）
 		lastIndex := m.Entries[len(m.Entries)-1].Index
 		rp.progress(lastIndex)
@@ -1340,10 +1324,9 @@ func (r *raft) sendReplicateMessage(to uint64) {
 	r.send(m)
 }
 
-// 向集群所有节点广播 Replicate 消息（领导者定期同步日志）。
+// broadcastReplicateMessage 向集群所有节点广播 Replicate 消息（领导者定期同步日志）。
 // 遍历所有节点（投票/非投票/见证），分别发送日志复制消息。
 func (r *raft) broadcastReplicateMessage() {
-
 	r.mustBeLeader() // 仅领导者可广播复制消息
 
 	// 非投票节点不应广播复制消息（防御性检查）
@@ -1361,36 +1344,30 @@ func (r *raft) broadcastReplicateMessage() {
 	}
 }
 
-// 向目标节点发送 Heartbeat 消息（领导者维持领导权的心跳）。
+// sendHeartbeatMessage 向目标节点发送 Heartbeat 消息（领导者维持领导权的心跳）。
 // 心跳消息包含领导者的已提交索引，用于通知跟随者更新提交进度。
+// 参数：
+//   - to: 目标节点 ID
+//   - hint: 系统上下文低 64 位（如 ReadIndex 请求 ID）
+//   - match: 目标节点的已匹配日志索引（用于优化提交索引计算）
 func (r *raft) sendHeartbeatMessage(to uint64,
 	hint pb.SystemCtx, match uint64) {
-
-	// 参数：
-	//   - to: 目标节点 ID
-	//   - hint: 系统上下文低 64 位（如 ReadIndex 请求 ID）
-	//   - match: 目标节点的已匹配日志索引（用于优化提交索引计算）
-
-	commit := min(match, r.log.committed) // 最小值（确保安全性）
-
+	// 提交索引取目标节点已匹配索引与领导者已提交索引的最小值（确保安全性）
+	commit := min(match, r.log.committed)
 	r.send(pb.Message{
 		To:       to,           // 目标节点
 		Type:     pb.Heartbeat, // 消息类型：心跳
 		Commit:   commit,       // 领导者建议的提交索引
 		Hint:     hint.Low,     // 系统上下文低 64 位
 		HintHigh: hint.High,    // 系统上下文高 64 位
-		// SystemCtx is used to identify a ReadIndex operation.
 	})
 }
 
-// 向集群所有投票成员广播心跳消息（领导者定期发送，默认每秒几次）。
+// broadcastHeartbeatMessage 向集群所有投票成员广播心跳消息（领导者定期发送，默认每秒几次）。
 // 若存在未完成的 ReadIndex 请求，心跳消息会携带 ReadIndex 上下文，用于线性一致性读确认。
 // 参考 Raft 论文 6.4 节：ReadIndex 协议通过心跳消息传播已提交索引，确保读操作线性一致性。
-// p72 of the raft thesis describe how to use Heartbeat message in the ReadIndex  protocol.
 func (r *raft) broadcastHeartbeatMessage() {
-
 	r.mustBeLeader() // 仅领导者可广播心跳
-
 	if r.readIndex.hasPendingRequest() {
 		// 存在未完成的 ReadIndex 请求，携带上下文（用于确认读操作安全性）
 		ctx := r.readIndex.peepCtx()
@@ -1401,14 +1378,12 @@ func (r *raft) broadcastHeartbeatMessage() {
 	}
 }
 
-// 向集群节点广播携带特定上下文的心跳消息。
+// broadcastHeartbeatMessageWithHint 向集群节点广播携带特定上下文的心跳消息。
 // 用于 ReadIndex 协议：通过心跳传播 ReadIndex 上下文，收集集群多数派已提交索引的确认。
 // 参数：
 //   - ctx: 系统上下文（如 ReadIndex 请求 ID）
 func (r *raft) broadcastHeartbeatMessageWithHint(ctx pb.SystemCtx) {
-
 	zeroCtx := pb.SystemCtx{}
-
 	// 向所有投票成员发送心跳（携带上下文，用于 ReadIndex 确认）
 	for id, rm := range r.votingMembers() {
 		if id != r.replicaID {
@@ -1423,7 +1398,7 @@ func (r *raft) broadcastHeartbeatMessageWithHint(ctx pb.SystemCtx) {
 	}
 }
 
-// 发送 TimeoutNow 消息，触发目标节点立即发起选举（用于领导者转移）。
+// sendTimeoutNowMessage 发送 TimeoutNow 消息，触发目标节点立即发起选举（用于领导者转移）。
 // Raft 领导者转移协议通过此消息通知目标节点提前超时并竞选领导者。
 // 参数：
 //   - replicaID: 目标节点 ID（期望成为新领导者的节点）
@@ -1434,16 +1409,248 @@ func (r *raft) sendTimeoutNowMessage(replicaID uint64) {
 	})
 }
 
+func (r *raft) quiescedTick() {
+	if !r.quiesce {
+		r.quiesce = true
+		r.log.inmem.resize()
+	}
+	r.electionTick++
+}
+
+func (r *raft) setRandomizedElectionTimeout() {
+	randTime := random.LockGuardedRand.Uint64() % r.electionTimeout
+	r.randomizedElectionTimeout = r.electionTimeout + randTime
+}
+
+//
+// send and broadcast functions
+//
+
+func (r *raft) finalizeMessageTerm(m pb.Message) pb.Message {
+	if m.Term == 0 && m.Type == pb.RequestVote {
+		plog.Panicf("%s sending RequestVote with 0 term", r.describe())
+	}
+	if m.Term > 0 &&
+		!isRequestVoteMessage(m.Type) && m.Type != pb.RequestPreVoteResp {
+		plog.Panicf("%s term unexpectedly set for message type %d",
+			r.describe(), m.Type)
+	}
+	if !isRequestMessage(m.Type) &&
+		!isRequestVoteMessage(m.Type) && m.Type != pb.RequestPreVoteResp {
+		m.Term = r.term
+	}
+	return m
+}
+
+func (r *raft) send(m pb.Message) {
+	m.From = r.replicaID
+	m = r.finalizeMessageTerm(m)
+	r.msgs = append(r.msgs, m)
+}
+
+func (r *raft) sendRateLimitMessage() {
+	if r.isLeader() {
+		plog.Panicf("leader node called sendRateLimitMessage")
+	}
+	if r.leaderID == NoLeader {
+		plog.Infof("%s rate limit message skipped, no leader", r.describe())
+		return
+	}
+	if !r.rl.Enabled() {
+		return
+	}
+	mv := uint64(0)
+	if r.rl.RateLimited() {
+		inmemSz := r.rl.Get()
+		notCommitedSz := getEntrySliceSize(r.log.getUncommittedEntries())
+		mv = max(inmemSz-notCommitedSz, 0)
+	}
+	r.send(pb.Message{
+		Type: pb.RateLimit,
+		To:   r.leaderID,
+		Hint: mv,
+	})
+}
+
+func (r *raft) makeInstallSnapshotMessage(to uint64, m *pb.Message) uint64 {
+	m.To = to
+	m.Type = pb.InstallSnapshot
+	snapshot := r.log.snapshot()
+	if pb.IsEmptySnapshot(snapshot) {
+		plog.Panicf("%s got an empty snapshot", r.describe())
+	}
+	// For witness, snapshot message will be marked as dummy snapshot.
+	if _, ok := r.witnesses[to]; ok {
+		snapshot = makeWitnessSnapshot(snapshot)
+	}
+	m.Snapshot = snapshot
+	return snapshot.Index
+}
+
+func makeWitnessSnapshot(snapshot pb.Snapshot) pb.Snapshot {
+	result := snapshot
+	result.Filepath = ""
+	result.FileSize = 0
+	result.Files = nil
+	result.Witness = true
+	result.Dummy = false
+	return result
+}
+
+func (r *raft) makeReplicateMessage(to uint64,
+	next uint64, maxSize uint64) (pb.Message, error) {
+	term, err := r.log.term(next - 1)
+	if err != nil {
+		return pb.Message{}, err
+	}
+	entries, err := r.log.entries(next, maxSize)
+	if err != nil {
+		return pb.Message{}, err
+	}
+	if len(entries) > 0 {
+		lastIndex := entries[len(entries)-1].Index
+		expected := next - 1 + uint64(len(entries))
+		if lastIndex != expected {
+			plog.Panicf("%s expected last index in Replicate %d, got %d",
+				r.describe(), expected, lastIndex)
+		}
+	}
+	// Don't send actual log entry to witness as they won't replicate real message,
+	// unless there is a config change.
+	if _, ok := r.witnesses[to]; ok {
+		entries = makeMetadataEntries(entries)
+	}
+	return pb.Message{
+		To:       to,
+		Type:     pb.Replicate,
+		LogIndex: next - 1,
+		LogTerm:  term,
+		Entries:  entries,
+		Commit:   r.log.committed,
+	}, nil
+}
+
+func makeMetadataEntries(entries []pb.Entry) []pb.Entry {
+	me := make([]pb.Entry, 0, len(entries))
+	for _, ent := range entries {
+		if ent.Type != pb.ConfigChangeEntry {
+			me = append(me, pb.Entry{
+				Type:  pb.MetadataEntry,
+				Index: ent.Index,
+				Term:  ent.Term,
+			})
+		} else {
+			me = append(me, ent)
+		}
+	}
+	return me
+}
+
+func (r *raft) sendReplicateMessage(to uint64) {
+	var rp *remote
+	if v, ok := r.remotes[to]; ok {
+		rp = v
+	} else if v, ok := r.nonVotings[to]; ok {
+		rp = v
+	} else {
+		rp, ok = r.witnesses[to]
+		if !ok {
+			plog.Panicf("%s failed to get the remote instance", r.describe())
+		}
+	}
+	if rp.isPaused() {
+		return
+	}
+	m, err := r.makeReplicateMessage(to, rp.next, maxEntrySize)
+	if err != nil {
+		// log not available due to compaction, send snapshot
+		if !rp.isActive() {
+			plog.Warningf("%s, %s is not active, sending snapshot is skipped",
+				r.describe(), ReplicaID(to))
+			return
+		}
+		index := r.makeInstallSnapshotMessage(to, &m)
+		plog.Infof("%s is sending snapshot (%d) to %s, r.Next %d, r.Match %d, %v",
+			r.describe(), index, ReplicaID(to), rp.next, rp.match, err)
+		rp.becomeSnapshot(index)
+	} else if len(m.Entries) > 0 {
+		lastIndex := m.Entries[len(m.Entries)-1].Index
+		rp.progress(lastIndex)
+	}
+	r.send(m)
+}
+
+func (r *raft) broadcastReplicateMessage() {
+	r.mustBeLeader()
+	for nid := range r.nonVotings {
+		if nid == r.replicaID {
+			plog.Panicf("%s nonVoting is broadcasting Replicate msg", r.describe())
+		}
+	}
+	for _, nid := range r.nodes() {
+		if nid != r.replicaID {
+			r.sendReplicateMessage(nid)
+		}
+	}
+}
+
+func (r *raft) sendHeartbeatMessage(to uint64,
+	hint pb.SystemCtx, match uint64) {
+	commit := min(match, r.log.committed)
+	r.send(pb.Message{
+		To:       to,
+		Type:     pb.Heartbeat,
+		Commit:   commit,
+		Hint:     hint.Low,
+		HintHigh: hint.High,
+	})
+}
+
+// p72 of the raft thesis describe how to use Heartbeat message in the ReadIndex
+// protocol.
+func (r *raft) broadcastHeartbeatMessage() {
+	r.mustBeLeader()
+	if r.readIndex.hasPendingRequest() {
+		ctx := r.readIndex.peepCtx()
+		r.broadcastHeartbeatMessageWithHint(ctx)
+	} else {
+		r.broadcastHeartbeatMessageWithHint(pb.SystemCtx{})
+	}
+}
+
+func (r *raft) broadcastHeartbeatMessageWithHint(ctx pb.SystemCtx) {
+	zeroCtx := pb.SystemCtx{}
+	for id, rm := range r.votingMembers() {
+		if id != r.replicaID {
+			r.sendHeartbeatMessage(id, ctx, rm.match)
+		}
+	}
+	if ctx == zeroCtx {
+		for id, rm := range r.nonVotings {
+			r.sendHeartbeatMessage(id, zeroCtx, rm.match)
+		}
+	}
+}
+
+// sendTimeoutNowMessage 发送 TimeoutNow 消息，触发目标节点立即发起选举（用于领导者转移）。
+// Raft 领导者转移协议通过此消息通知目标节点提前超时并竞选领导者，加速领导权交接。
+// 参数：
+//   - replicaID: 目标节点 ID（期望成为新领导者的节点）
+func (r *raft) sendTimeoutNowMessage(replicaID uint64) {
+	r.send(pb.Message{
+		Type: pb.TimeoutNow, // 消息类型：立即超时（触发目标节点选举）
+		To:   replicaID,     // 目标节点 ID
+	})
+}
+
 //
 // log append and commit
 //
 
 // sortMatchValues 对投票成员的日志匹配索引（match）进行排序，用于计算多数派提交索引。
+// 采用手动展开的冒泡排序（非标准库 sort，避免内存分配），针对小规模数组（投票成员数）高效。
 func (r *raft) sortMatchValues() {
-
-	// unrolled bubble sort, sort.Slice is not allocation free
-	// 采用手动展开的冒泡排序（非标准库 sort，避免sort.Slice 的内存分配），针对小规模数组（投票成员数）高效。
-
+	// 手动展开冒泡排序（针对小规模数组优化，避免 sort.Slice 的内存分配）
 	if len(r.matched) == 3 {
 		if r.matched[0] > r.matched[1] {
 			v := r.matched[0]
@@ -1476,7 +1683,6 @@ func (r *raft) sortMatchValues() {
 //   - bool: 是否成功提交新日志
 //   - error: 提交过程中遇到的错误（如日志操作失败）
 func (r *raft) tryCommit() (bool, error) {
-
 	r.mustBeLeader() // 仅领导者可执行提交逻辑
 
 	// 若投票成员数与匹配值数组长度不匹配，重置匹配值数组（确保数据一致性）
@@ -1484,7 +1690,7 @@ func (r *raft) tryCommit() (bool, error) {
 		r.resetMatchValueArray()
 	}
 
-	// 收集所有投票成员的匹配索引
+	// 收集所有投票成员的匹配索引（本地节点 + 远程节点）
 	idx := 0
 	for _, v := range r.remotes {
 		r.matched[idx] = v.match
@@ -1498,21 +1704,19 @@ func (r *raft) tryCommit() (bool, error) {
 	// 排序匹配索引，计算多数派阈值（quorum）对应的索引
 	r.sortMatchValues()
 	q := r.matched[r.numVotingMembers()-r.quorum()] // 多数派阈值位置 = 总成员数 - 法定人数
-	// 也就是说，达到q的索引表明已经有多数派确认，此时可以提交，不必等待所有都确认
 
 	// Raft 论文 5.4.2 节：仅当前任期的日志条目可通过计数副本提交，旧任期条目需通过当前任期条目间接提交
-
-	// see p8 raft paper
-	// "Raft never commits log entries from previous terms by counting replicas.
-	// Only log entries from the leader’s current term are committed by counting replicas"
-
 	return r.log.tryCommit(q, r.term)
 }
 
 // appendEntries 将新日志条目追加到本地日志，并触发单节点集群的自动提交。
 // 条目追加时会自动填充任期（当前领导者任期）和索引（基于日志最后索引递增）。
+// 参数：
+//   - entries: 待追加的日志条目列表
+//
+// 返回值：
+//   - error: 日志追加过程中遇到的错误
 func (r *raft) appendEntries(entries []pb.Entry) error {
-
 	lastIndex := r.log.lastIndex() // 获取当前日志最后索引
 
 	// 填充每个条目的任期和索引（确保条目连续性）
@@ -1522,9 +1726,7 @@ func (r *raft) appendEntries(entries []pb.Entry) error {
 	}
 
 	r.log.append(entries) // 追加条目到本地日志
-
 	// 更新本地节点的匹配索引（自身日志始终匹配）
-	// 当当前节点成功追加新日志条目后（如通过appendEntries方法），通过此代码将自身的已匹配日志索引（match） 更新为最新日志索引。
 	r.remotes[r.replicaID].tryUpdate(r.log.lastIndex())
 
 	// 单节点集群（法定人数为1）：追加后立即提交
@@ -1540,32 +1742,29 @@ func (r *raft) appendEntries(entries []pb.Entry) error {
 // state transition related functions
 //
 
-// 将节点转换为跟随者状态，重置任期和选举计时器。
+// toFollowerState 将节点转换为跟随者状态，重置任期和选举计时器。
 // 内部状态转换函数，被 `becomeFollower` 等公开方法调用。
+// 参数：
+//   - term: 新任期号
+//   - leaderID: 领导者节点 ID
+//   - resetElectionTimeout: 是否重置选举计时器（避免立即触发新选举）
 func (r *raft) toFollowerState(term uint64, leaderID uint64,
 	resetElectionTimeout bool) {
-	// 参数：
-	//   - term: 新任期号
-	//   - leaderID: 领导者节点 ID
-	//   - resetElectionTimeout: 是否重置选举计时器（避免立即触发新选举）
-
 	if r.isWitness() {
 		panic("transitioning to follower from witness state") // 见证节点不能直接转为跟随者
 	}
-
 	r.state = follower                  // 更新状态为跟随者
 	r.reset(term, resetElectionTimeout) // 重置任期、计时器等状态
 	r.setLeaderID(leaderID)             // 设置领导者 ID
 	plog.Infof("%s became follower", r.describe())
 }
 
-// 将节点转换为非投票成员状态（仅适用于已是非投票节点的场景）。
+// becomeNonVoting 将节点转换为非投票成员状态（仅适用于已是非投票节点的场景）。
+// 非投票节点参与日志复制但不参与选举和投票，通常用于集群扩容时的预热。
+// 参数：
+//   - term: 新任期号
+//   - leaderID: 领导者节点 ID
 func (r *raft) becomeNonVoting(term uint64, leaderID uint64) {
-	// 非投票节点参与日志复制但不参与选举和投票，通常用于集群扩容时的预热。
-	// 参数：
-	//   - term: 新任期号
-	//   - leaderID: 领导者节点 ID
-
 	if !r.isNonVoting() {
 		panic("transitioning to nonVoting state from other states") // 仅非投票节点可调用
 	}
@@ -1649,9 +1848,7 @@ func (r *raft) becomeCandidate() {
 // 返回值：
 //   - error: 成为领导者过程中遇到的错误（如日志追加失败）
 func (r *raft) becomeLeader() error {
-
 	// 状态转换合法性检查：仅候选者可成为领导者
-	// need a state transition machine
 	if !r.isLeader() && !r.isCandidate() {
 		plog.Panicf("transitioning to leader state from %v", r.state.String())
 	}
@@ -1661,35 +1858,16 @@ func (r *raft) becomeLeader() error {
 	r.preLeaderPromotionHandleConfigChange() // 处理未提交的配置变更
 	plog.Infof("%s became leader", r.describe())
 
-	// p72 of the raft thesis
 	// Raft 论文 6.4 节：领导者需追加一条空日志条目（dummy entry）以提交旧任期日志
 	return r.appendEntries([]pb.Entry{{Type: pb.ApplicationEntry, Cmd: nil}})
-
-	/*
-		根据 Raft 论文 6.4 节（安全性） 的规定：
-
-		Raft 仅通过计数副本提交当前任期的日志条目，旧任期的日志条目无法直接通过副本计数提交，必须通过当前任期的日志条目间接提交。
-
-		因此，领导者当选后需立即生成一条当前任期的日志条目（即使没有客户端请求），当这条条目被复制到多数派节点并提交后，会间接提交所有之前的旧任期日志条目，确保集群状态一致性。
-
-		该行代码：
-
-		安全性保证：若领导者不追加当前任期的日志条目，直接处理客户端请求，可能导致
-		旧任期日志条目长期无法提交（例如无客户端请求时），违反 Raft 安全性要求。
-
-		快速提交旧日志：通过主动生成空条目，确保领导者当选后立即启动日志复制流程，快速提交所有历史日志，避免集群恢复后长时间处于不一致状态。
-
-	*/
-
 }
 
 // reset 重置 Raft 节点的核心状态（任期、计时器、投票、复制进度等）。
 // 用于状态转换（如成为候选者/跟随者）或异常恢复时的状态清理。
+// 参数：
+//   - term: 新任期号
+//   - resetElectionTimeout: 是否重置选举计时器（触发随机化超时）
 func (r *raft) reset(term uint64, resetElectionTimeout bool) {
-
-	// 参数：
-	//   - term: 新任期号
-	//   - resetElectionTimeout: 是否重置选举计时器（触发随机化超时）
 	// 若任期变更，重置投票状态（当前任期未投票）
 	if r.term != term {
 		r.term = term
@@ -1721,18 +1899,207 @@ func (r *raft) reset(term uint64, resetElectionTimeout bool) {
 	r.resetMatchValueArray()
 }
 
-// 处理节点晋升为leader前的未提交配置变更条目。
+func (r *raft) sendTimeoutNowMessage(replicaID uint64) {
+	r.send(pb.Message{
+		Type: pb.TimeoutNow,
+		To:   replicaID,
+	})
+}
+
+//
+// log append and commit
+//
+
+func (r *raft) sortMatchValues() {
+	// unrolled bubble sort, sort.Slice is not allocation free
+	if len(r.matched) == 3 {
+		if r.matched[0] > r.matched[1] {
+			v := r.matched[0]
+			r.matched[0] = r.matched[1]
+			r.matched[1] = v
+		}
+		if r.matched[1] > r.matched[2] {
+			v := r.matched[1]
+			r.matched[1] = r.matched[2]
+			r.matched[2] = v
+		}
+		if r.matched[0] > r.matched[1] {
+			v := r.matched[0]
+			r.matched[0] = r.matched[1]
+			r.matched[1] = v
+		}
+	} else if len(r.matched) == 1 {
+		return
+	} else {
+		sort.Slice(r.matched, func(i, j int) bool {
+			return r.matched[i] < r.matched[j]
+		})
+	}
+}
+
+func (r *raft) tryCommit() (bool, error) {
+	r.mustBeLeader()
+	if r.numVotingMembers() != len(r.matched) {
+		r.resetMatchValueArray()
+	}
+	idx := 0
+	for _, v := range r.remotes {
+		r.matched[idx] = v.match
+		idx++
+	}
+	for _, v := range r.witnesses {
+		r.matched[idx] = v.match
+		idx++
+	}
+	r.sortMatchValues()
+	q := r.matched[r.numVotingMembers()-r.quorum()]
+	// see p8 raft paper
+	// "Raft never commits log entries from previous terms by counting replicas.
+	// Only log entries from the leader’s current term are committed by counting
+	// replicas"
+	return r.log.tryCommit(q, r.term)
+}
+
+func (r *raft) appendEntries(entries []pb.Entry) error {
+	lastIndex := r.log.lastIndex()
+	for i := range entries {
+		entries[i].Term = r.term
+		entries[i].Index = lastIndex + 1 + uint64(i)
+	}
+	r.log.append(entries)
+	r.remotes[r.replicaID].tryUpdate(r.log.lastIndex())
+	if r.isSingleNodeQuorum() {
+		if _, err := r.tryCommit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+//
+// state transition related functions
+//
+
+func (r *raft) toFollowerState(term uint64, leaderID uint64,
+	resetElectionTimeout bool) {
+	if r.isWitness() {
+		panic("transitioning to follower from witness state")
+	}
+	r.state = follower
+	r.reset(term, resetElectionTimeout)
+	r.setLeaderID(leaderID)
+	plog.Infof("%s became follower", r.describe())
+}
+
+func (r *raft) becomeNonVoting(term uint64, leaderID uint64) {
+	if !r.isNonVoting() {
+		panic("transitioning to nonVoting state from other states")
+	}
+	if r.isWitness() {
+		panic("transitioning to nonVoting from witness state")
+	}
+	r.reset(term, true)
+	r.setLeaderID(leaderID)
+	plog.Infof("%s became nonVoting", r.describe())
+}
+
+func (r *raft) becomeWitness(term uint64, leaderID uint64) {
+	if !r.isWitness() {
+		panic("transitioning to witness state from non-witness")
+	}
+	r.reset(term, true)
+	r.setLeaderID(leaderID)
+	plog.Infof("%s became witness", r.describe())
+}
+
+func (r *raft) becomeFollower(term uint64, leaderID uint64) {
+	r.toFollowerState(term, leaderID, true)
+}
+
+func (r *raft) becomeFollowerKE(term uint64, leaderID uint64) {
+	r.toFollowerState(term, leaderID, false)
+}
+
+func (r *raft) becomePreVoteCandidate() {
+	if !r.preVote {
+		panic("becomePreVoteCandidate called when preVote not enabled")
+	}
+	if r.isLeader() {
+		panic("transitioning to candidate state from leader")
+	}
+	if r.isNonVoting() {
+		panic("nonVoting is becoming candidate")
+	}
+	if r.isWitness() {
+		panic("witness is becoming candidate")
+	}
+	r.state = preVoteCandidate
+	r.reset(r.term, true)
+	r.setLeaderID(NoLeader)
+	plog.Warningf("%s became PreVote candidate", r.describe())
+}
+
+func (r *raft) becomeCandidate() {
+	if r.isLeader() {
+		panic("transitioning to candidate state from leader")
+	}
+	if r.isNonVoting() {
+		panic("nonVoting is becoming candidate")
+	}
+	if r.isWitness() {
+		panic("witness is becoming candidate")
+	}
+	r.state = candidate
+	// 2nd paragraph section 5.2 of the raft paper
+	r.reset(r.term+1, true)
+	r.setLeaderID(NoLeader)
+	r.vote = r.replicaID
+	plog.Warningf("%s became candidate", r.describe())
+}
+
+func (r *raft) becomeLeader() error {
+	// need a state transition machine
+	if !r.isLeader() && !r.isCandidate() {
+		plog.Panicf("transitioning to leader state from %v", r.state.String())
+	}
+	r.state = leader
+	r.reset(r.term, true)
+	r.setLeaderID(r.replicaID)
+	r.preLeaderPromotionHandleConfigChange()
+	plog.Infof("%s became leader", r.describe())
+	// p72 of the raft thesis
+	return r.appendEntries([]pb.Entry{{Type: pb.ApplicationEntry, Cmd: nil}})
+}
+
+func (r *raft) reset(term uint64, resetElectionTimeout bool) {
+	if r.term != term {
+		r.term = term
+		r.vote = NoLeader
+	}
+	if r.rl.Enabled() {
+		r.rl.Reset()
+	}
+	if resetElectionTimeout {
+		r.electionTick = 0
+		r.setRandomizedElectionTimeout()
+	}
+	r.votes = make(map[uint64]bool)
+	r.heartbeatTick = 0
+	r.readIndex = newReadIndex()
+	r.clearPendingConfigChange()
+	r.abortLeaderTransfer()
+	r.resetRemotes()
+	r.resetNonVotings()
+	r.resetWitnesses()
+	r.resetMatchValueArray()
+}
+
+// preLeaderPromotionHandleConfigChange 处理领导者晋升前的未提交配置变更条目。
 // 确保领导者在晋升时最多只有一个未应用的配置变更条目，避免因多配置变更同时提交导致的 quorum 重叠问题。
 func (r *raft) preLeaderPromotionHandleConfigChange() {
-
-	// 1. 获取已提交但未应用的配置变更条目数量
 	n := r.getPendingConfigChangeCount()
-
-	// 2. 若存在多个未提交配置变更，直接 panic（违反 Raft 安全原则）
 	if n > 1 {
 		plog.Panicf("%s multiple uncommitted config change entries", r.describe())
-
-		// 3. 若存在一个未提交配置变更，标记为待处理状态
 	} else if n == 1 {
 		plog.Infof("%s becoming leader with pending ConfigChange", r.describe())
 		r.setPendingConfigChange() // 标记存在未提交配置变更
@@ -1740,12 +2107,8 @@ func (r *raft) preLeaderPromotionHandleConfigChange() {
 }
 
 // resetRemotes 重置所有投票成员的复制进度跟踪状态（match/next 索引）。
+// Raft 论文 5.3 节：领导者首次掌权时，将所有 nextIndex 初始化为自身日志最后索引 + 1。
 func (r *raft) resetRemotes() {
-
-	// Raft 论文 5.3 节：领导者首次掌权时，将所有 nextIndex 初始化为自身日志最后索引 + 1。
-	// see section 5.3 of the raft paper
-	// "When a leader first comes to power, it initializes all nextIndex values to the index just after the last one in its log"
-
 	for id := range r.remotes {
 		// 初始化复制进度：next 为日志最后索引 + 1，match 默认为 0（自身节点设为日志最后索引）
 		r.remotes[id] = &remote{
@@ -1785,12 +2148,15 @@ func (r *raft) resetWitnesses() {
 // election related functions
 //
 
-// 处理投票响应（预选举/正式选举），统计已收到的赞成票数。
+// handleVoteResp 处理投票响应（预选举/正式选举），统计已收到的赞成票数。
+// 参数：
+//   - from: 投票节点 ID
+//   - rejected: 是否拒绝投票
+//   - preVote: 是否为预选举阶段
+//
+// 返回值：
+//   - int: 当前已收到的赞成票数
 func (r *raft) handleVoteResp(from uint64, rejected bool, preVote bool) int {
-	//   - from: 投票节点 ID
-	//   - rejected: 是否拒绝投票
-	//   - preVote: 是否为预选举阶段
-
 	mname := "RequestVoteResp"
 	if preVote {
 		mname = "RequestPreVoteResp" // 预选举响应类型
@@ -1804,7 +2170,7 @@ func (r *raft) handleVoteResp(from uint64, rejected bool, preVote bool) int {
 
 	votedFor := 0
 	// 记录投票（避免重复统计同一节点的投票）
-	if _, ok := r.votes[from]; !ok { //投票节点from没有在节点r的投票列表中出现
+	if _, ok := r.votes[from]; !ok {
 		r.votes[from] = !rejected // true 表示赞成票
 	}
 	// 统计总赞成票数
@@ -1813,10 +2179,10 @@ func (r *raft) handleVoteResp(from uint64, rejected bool, preVote bool) int {
 			votedFor++
 		}
 	}
-	return votedFor //- int: 当前已收到的赞成票数
+	return votedFor
 }
 
-// 启动预选举流程（PreVote 优化），避免网络分区导致的任期膨胀。
+// preVoteCampaign 启动预选举流程（PreVote 优化），避免网络分区导致的任期膨胀。
 // 预选举要求候选者先获取多数派节点的预投票，证明其日志足够新，才允许发起正式选举。
 func (r *raft) preVoteCampaign() error {
 	r.becomePreVoteCandidate()                 // 转为预选举候选者状态
@@ -1854,7 +2220,6 @@ func (r *raft) preVoteCampaign() error {
 // campaign 启动正式选举流程，向集群所有投票成员发送 RequestVote 请求。
 // 若获得多数派投票，则晋升为领导者。
 func (r *raft) campaign() error {
-
 	r.becomeCandidate() // 转为正式选举候选者状态
 	term := r.term
 
@@ -1929,7 +2294,6 @@ func (r *raft) selfRemoved() bool {
 // addNode 将节点添加为投票成员，支持从非投票成员晋升或新增节点。
 // 若为本地节点晋升，自动转为跟随者状态（非投票节点不参与选举）。
 func (r *raft) addNode(replicaID uint64) {
-
 	r.clearPendingConfigChange() // 清除未决配置变更
 
 	// 见证节点不能直接晋升为投票成员（需通过配置变更流程）
@@ -1939,16 +2303,13 @@ func (r *raft) addNode(replicaID uint64) {
 
 	// 已为投票成员，无需重复添加
 	if _, ok := r.remotes[replicaID]; ok {
-		// already a voting member
 		return
 	}
 
 	// 从非投票成员晋升（继承复制进度）
 	if rp, ok := r.nonVotings[replicaID]; ok {
-		// promoting to full member with inherited progress info
 		r.deleteNonVoting(replicaID)
 		r.remotes[replicaID] = rp
-		// local peer promoted, become follower
 		// 本地节点晋升为投票成员，转为跟随者（非投票节点可能之前处于特殊状态）
 		if replicaID == r.replicaID {
 			r.becomeFollower(r.term, r.leaderID)
@@ -2026,7 +2387,6 @@ func (r *raft) removeNode(replicaID uint64) error {
 
 // deleteRemote 从投票成员映射中删除节点。
 func (r *raft) deleteRemote(replicaID uint64) {
-	// 函数来自package builtin
 	delete(r.remotes, replicaID)
 }
 
@@ -2070,36 +2430,6 @@ func (r *raft) setWitness(replicaID uint64, match uint64, next uint64) {
 	}
 }
 
-/*
-helper methods required for the membership change implementation
-
-p33-35 of the raft thesis describes a simple membership change protocol which requires only one node can be added or removed at a time. its safety is guarded by the fact that when there is only one node to be added or removed at a time, the old and new quorum are guaranteed to overlap.
-the protocol described in the raft thesis requires the membership change entry to be executed as soon as it is appended. this also introduces an extra troublesome step to roll back to an old membership configuration when necessary.
-similar to etcd raft, we treat such membership change entry as regular entries that are only executed after being committed (by the old quorum).
-to do that, however, we need to further restrict the leader to only has at most one pending not applied membership change entry in its log. this is to avoid the situation that two pending membership change entries are committed in one go with the same quorum while they actually require different quorums.
-consider the following situation - for a 3 nodes shard with existing members X, Y and Z, let's say we first propose a membership change to add a new node A, before A gets committed and applied, say we propose another membership change to add a new node B. When B gets committed, A will be committed as well, both will be using the 3 node membership quorum meaning both entries concerning A and B will become committed when any two of the X, Y, Z shard have them replicated. this thus violates the safety requirement as B will require 3 out of the 4 nodes (X,
-Y, Z, A) to have it replicated before it can be committed.
-we use the following pendingConfigChange flag to help tracking whether there is already a pending membership change entry in the log waiting to be executed.
-*/
-
-// 用于成员变更实现的辅助方法
-//
-// Raft论文第33-35页描述了一个简单的成员变更协议，该协议要求一次只能添加或删除一个节点。
-// 其安全性由以下事实保证：当一次只添加或删除一个节点时，旧的和新的法定人数保证会重叠。
-// Raft论文中描述的协议要求成员变更条目一旦追加就必须立即执行。
-// 这也引入了一个额外的麻烦步骤，即在必要时回滚到旧的成员配置。
-// 与etcd raft类似，我们将这样的成员变更条目视为普通条目，只有在提交后（由旧的法定人数）才会执行。
-// 然而，为了做到这一点，我们需要进一步限制领导者在其日志中最多只能有一个待处理的未应用成员变更条目。
-// 这是为了避免两个待处理的成员变更条目使用相同的法定人数一次性提交，
-// 而实际上它们需要不同的法定人数。
-// 考虑以下情况 - 对于一个包含现有成员X、Y和Z的3节点分片，
-// 假设我们首先提议一个成员变更来添加新节点A，在A被提交和应用之前，
-// 我们又提议另一个成员变更来添加新节点B。
-// 当B被提交时，A也会被提交，两者都将使用3节点成员法定人数，
-// 这意味着关于A和B的条目将在X、Y、Z分片中的任意两个复制后就变为已提交。
-// 这因此违反了安全要求，因为B需要4个节点（X、Y、Z、A）中的3个复制它之后才能被提交。
-// 我们使用以下pendingConfigChange标志来帮助跟踪日志中是否已经有一个待处理的成员变更条目等待执行。
-
 // setPendingConfigChange 标记存在未提交的配置变更条目。
 // Raft 配置变更安全要求：同一时间只能有一个未提交的配置变更，避免新旧 quorum 无重叠。
 func (r *raft) setPendingConfigChange() {
@@ -2116,7 +2446,7 @@ func (r *raft) clearPendingConfigChange() {
 	r.pendingConfigChange = false
 }
 
-// 统计已提交但未应用的配置变更条目数量。
+// getPendingConfigChangeCount 统计已提交但未应用的配置变更条目数量。
 // 确保同一时间最多只有一个未应用的配置变更，避免安全风险。
 func (r *raft) getPendingConfigChangeCount() int {
 	idx := r.log.committed + 1 // 从已提交索引的下一条开始检查
@@ -2134,10 +2464,333 @@ func (r *raft) getPendingConfigChangeCount() int {
 	}
 }
 
+func (r *raft) preLeaderPromotionHandleConfigChange() {
+	n := r.getPendingConfigChangeCount()
+	if n > 1 {
+		plog.Panicf("%s multiple uncommitted config change entries", r.describe())
+	} else if n == 1 {
+		plog.Infof("%s becoming leader with pending ConfigChange", r.describe())
+		r.setPendingConfigChange()
+	}
+}
+
+// see section 5.3 of the raft paper
+// "When a leader first comes to power, it initializes all nextIndex values to
+// the index just after the last one in its log"
+func (r *raft) resetRemotes() {
+	for id := range r.remotes {
+		r.remotes[id] = &remote{
+			next: r.log.lastIndex() + 1,
+		}
+		if id == r.replicaID {
+			r.remotes[id].match = r.log.lastIndex()
+		}
+	}
+}
+
+func (r *raft) resetNonVotings() {
+	for id := range r.nonVotings {
+		r.nonVotings[id] = &remote{
+			next: r.log.lastIndex() + 1,
+		}
+		if id == r.replicaID {
+			r.nonVotings[id].match = r.log.lastIndex()
+		}
+	}
+}
+
+func (r *raft) resetWitnesses() {
+	for id := range r.witnesses {
+		r.witnesses[id] = &remote{
+			next: r.log.lastIndex() + 1,
+		}
+		if id == r.replicaID {
+			r.witnesses[id].match = r.log.lastIndex()
+		}
+	}
+}
+
 //
-// message handlers used by follower
+// election related functions
 //
 
+func (r *raft) handleVoteResp(from uint64, rejected bool, preVote bool) int {
+	mname := "RequestVoteResp"
+	if preVote {
+		mname = "RequestPreVoteResp"
+	}
+	if rejected {
+		plog.Warningf("%s received %s rejection from %s",
+			r.describe(), mname, ReplicaID(from))
+	} else {
+		plog.Warningf("%s received %s from %s",
+			r.describe(), mname, ReplicaID(from))
+	}
+	votedFor := 0
+	if _, ok := r.votes[from]; !ok {
+		r.votes[from] = !rejected
+	}
+	for _, v := range r.votes {
+		if v {
+			votedFor++
+		}
+	}
+	return votedFor
+}
+
+func (r *raft) preVoteCampaign() error {
+	r.becomePreVoteCandidate()
+	r.handleVoteResp(r.replicaID, false, true)
+	if r.isSingleNodeQuorum() {
+		return r.campaign()
+	}
+	index := r.log.lastIndex()
+	lastTerm, err := r.log.lastTerm()
+	if err != nil {
+		return err
+	}
+	for k := range r.votingMembers() {
+		if k == r.replicaID {
+			continue
+		}
+		r.send(pb.Message{
+			Term:     r.term + 1,
+			To:       k,
+			Type:     pb.RequestPreVote,
+			LogIndex: index,
+			LogTerm:  lastTerm,
+		})
+		plog.Warningf("%s sent RequestPreVote to %s", r.describe(), ReplicaID(k))
+	}
+	return nil
+}
+
+func (r *raft) campaign() error {
+	r.becomeCandidate()
+	term := r.term
+	if r.events != nil {
+		info := server.CampaignInfo{
+			ShardID:   r.shardID,
+			ReplicaID: r.replicaID,
+			Term:      term,
+		}
+		r.events.CampaignLaunched(info)
+	}
+	r.handleVoteResp(r.replicaID, false, false)
+	if r.isSingleNodeQuorum() {
+		return r.becomeLeader()
+	}
+	var hint uint64
+	if r.isLeaderTransferTarget {
+		hint = r.replicaID
+		r.isLeaderTransferTarget = false
+	}
+	index := r.log.lastIndex()
+	lastTerm, err := r.log.lastTerm()
+	if err != nil {
+		return err
+	}
+	for k := range r.votingMembers() {
+		if k == r.replicaID {
+			continue
+		}
+		r.send(pb.Message{
+			Term:     term,
+			To:       k,
+			Type:     pb.RequestVote,
+			LogIndex: index,
+			LogTerm:  lastTerm,
+			Hint:     hint,
+		})
+		plog.Warningf("%s sent RequestVote to %s", r.describe(), ReplicaID(k))
+	}
+	return nil
+}
+
+//
+// membership management
+//
+
+func (r *raft) selfRemoved() bool {
+	if r.isNonVoting() {
+		_, ok := r.nonVotings[r.replicaID]
+		return !ok
+	}
+	if r.isWitness() {
+		_, ok := r.witnesses[r.replicaID]
+		return !ok
+	}
+	_, ok := r.remotes[r.replicaID]
+	return !ok
+}
+
+func (r *raft) addNode(replicaID uint64) {
+	r.clearPendingConfigChange()
+	if replicaID == r.replicaID && r.isWitness() {
+		plog.Panicf("%s is witness", r.describe())
+	}
+	if _, ok := r.remotes[replicaID]; ok {
+		// already a voting member
+		return
+	}
+	if rp, ok := r.nonVotings[replicaID]; ok {
+		// promoting to full member with inherited progress info
+		r.deleteNonVoting(replicaID)
+		r.remotes[replicaID] = rp
+		// local peer promoted, become follower
+		if replicaID == r.replicaID {
+			r.becomeFollower(r.term, r.leaderID)
+		}
+	} else if _, ok := r.witnesses[replicaID]; ok {
+		panic("could not promote witness to full member")
+	} else {
+		r.setRemote(replicaID, 0, r.log.lastIndex()+1)
+	}
+}
+
+func (r *raft) addNonVoting(replicaID uint64) {
+	r.clearPendingConfigChange()
+	if replicaID == r.replicaID && !r.isNonVoting() {
+		plog.Panicf("%s is not a nonVoting", r.describe())
+	}
+	if _, ok := r.nonVotings[replicaID]; ok {
+		return
+	}
+	r.setNonVoting(replicaID, 0, r.log.lastIndex()+1)
+}
+
+func (r *raft) addWitness(replicaID uint64) {
+	r.clearPendingConfigChange()
+	if replicaID == r.replicaID && !r.isWitness() {
+		plog.Panicf("%s is not witness", r.describe())
+	}
+	if _, ok := r.witnesses[replicaID]; ok {
+		return
+	}
+	r.setWitness(replicaID, 0, r.log.lastIndex()+1)
+}
+
+func (r *raft) removeNode(replicaID uint64) error {
+	r.deleteRemote(replicaID)
+	r.deleteNonVoting(replicaID)
+	r.deleteWitness(replicaID)
+	r.clearPendingConfigChange()
+	// step down as leader once it is removed
+	if r.replicaID == replicaID && r.isLeader() {
+		r.becomeFollower(r.term, NoLeader)
+	}
+	if r.leaderTransfering() && r.leaderTransferTarget == replicaID {
+		r.abortLeaderTransfer()
+	}
+	if r.isLeader() && r.numVotingMembers() > 0 {
+		ok, err := r.tryCommit()
+		if err != nil {
+			return err
+		}
+		if ok {
+			r.broadcastReplicateMessage()
+		}
+	}
+	return nil
+}
+
+func (r *raft) deleteRemote(replicaID uint64) {
+	delete(r.remotes, replicaID)
+}
+
+func (r *raft) deleteNonVoting(replicaID uint64) {
+	delete(r.nonVotings, replicaID)
+}
+
+func (r *raft) deleteWitness(replicaID uint64) {
+	delete(r.witnesses, replicaID)
+}
+
+func (r *raft) setRemote(replicaID uint64, match uint64, next uint64) {
+	plog.Debugf("%s set remote %s, match %d, next %d",
+		r.describe(), ReplicaID(replicaID), match, next)
+	r.remotes[replicaID] = &remote{
+		next:  next,
+		match: match,
+	}
+}
+
+func (r *raft) setNonVoting(replicaID uint64, match uint64, next uint64) {
+	plog.Debugf("%s set nonVoting %s, match %d, next %d",
+		r.describe(), ReplicaID(replicaID), match, next)
+	r.nonVotings[replicaID] = &remote{
+		next:  next,
+		match: match,
+	}
+}
+
+func (r *raft) setWitness(replicaID uint64, match uint64, next uint64) {
+	plog.Debugf("%s set witness %s, match %d, next %d",
+		r.describe(), ReplicaID(replicaID), match, next)
+	r.witnesses[replicaID] = &remote{
+		next:  next,
+		match: match,
+	}
+}
+
+// helper methods required for the membership change implementation
+//
+// p33-35 of the raft thesis describes a simple membership change protocol which
+// requires only one node can be added or removed at a time. its safety is
+// guarded by the fact that when there is only one node to be added or removed
+// at a time, the old and new quorum are guaranteed to overlap.
+// the protocol described in the raft thesis requires the membership change
+// entry to be executed as soon as it is appended. this also introduces an extra
+// troublesome step to roll back to an old membership configuration when
+// necessary.
+// similar to etcd raft, we treat such membership change entry as regular
+// entries that are only executed after being committed (by the old quorum).
+// to do that, however, we need to further restrict the leader to only has at
+// most one pending not applied membership change entry in its log. this is to
+// avoid the situation that two pending membership change entries are committed
+// in one go with the same quorum while they actually require different quorums.
+// consider the following situation -
+// for a 3 nodes shard with existing members X, Y and Z, let's say we first
+// propose a membership change to add a new node A, before A gets committed and
+// applied, say we propose another membership change to add a new node B. When
+// B gets committed, A will be committed as well, both will be using the 3 node
+// membership quorum meaning both entries concerning A and B will become
+// committed when any two of the X, Y, Z shard have them replicated. this thus
+// violates the safety requirement as B will require 3 out of the 4 nodes (X,
+// Y, Z, A) to have it replicated before it can be committed.
+// we use the following pendingConfigChange flag to help tracking whether there
+// is already a pending membership change entry in the log waiting to be
+// executed.
+func (r *raft) setPendingConfigChange() {
+	r.pendingConfigChange = true
+}
+
+func (r *raft) hasPendingConfigChange() bool {
+	return r.pendingConfigChange
+}
+
+func (r *raft) clearPendingConfigChange() {
+	r.pendingConfigChange = false
+}
+
+func (r *raft) getPendingConfigChangeCount() int {
+	idx := r.log.committed + 1
+	count := 0
+	for {
+		ents, err := r.log.entries(idx, maxEntriesToApplySize)
+		if err != nil {
+			plog.Panicf("%s failed to get entries %v", r.describe(), err)
+		}
+		if len(ents) == 0 {
+			return count
+		}
+		count += countConfigChange(ents)
+		idx = ents[len(ents)-1].Index + 1
+	}
+}
+
+// handler for various message types
+//
 // handleFollowerPropose 处理跟随者节点收到的 Propose 消息（客户端提案）。
 // 跟随者不直接处理提案，而是转发给当前领导者（若存在）。
 // 参数：
@@ -2152,10 +2805,6 @@ func (r *raft) handleFollowerPropose(m pb.Message) error {
 		return nil
 	}
 	m.To = r.leaderID // 转发目标设为当前领导者
-
-	// the message might be queued by the transport layer, this violates the requirement of the entryQueue.get() func. copy the m.Entries to its own space.
-	// 消息可能被传输层排队，这违反了 entryQueue.get() 函数的要求。将 m.Entries 复制到它自己的空间中。
-
 	// 复制提案条目（避免原消息被复用导致的并发问题）
 	m.Entries = newEntrySlice(m.Entries)
 	r.send(m) // 转发提案给领导者
@@ -2268,11 +2917,6 @@ func (r *raft) handleFollowerInstallSnapshot(m pb.Message) error {
 // 返回值：
 //   - error: 选举触发过程中遇到的错误
 func (r *raft) handleFollowerTimeoutNow(m pb.Message) error {
-
-	// the last paragraph, p29 of the raft thesis mentions that this is nothing different from the clock moving forward quickly
-	// 最后一段，Raft 论文第 29 页提到，这与时钟快速向前移动没有什么不同
-	// 这段注释是在解释某种 Raft 协议行为或机制，指出在论文的第 29 页最后一段中提到，所讨论的情况或处理方式本质上等同于"时钟快速向前移动"的概念。这通常指的是在分布式系统中处理时间推进或超时机制的一种比喻性描述。
-
 	// Raft 论文 3.10 节：TimeoutNow 消息使目标节点立即超时并发起选举，加速领导者转移
 	plog.Debugf("%s TimeoutNow received", r.describe())
 	r.electionTick = r.randomizedElectionTimeout // 强制选举计时器达到超时阈值
@@ -2329,17 +2973,13 @@ func (r *raft) handleCandidateReadIndex(m pb.Message) error {
 	return nil
 }
 
-// when any of the following three methods
-// handleCandidateReplicate
-// handleCandidateInstallSnapshot
-// handleCandidateHeartbeat
-// is called, it implies that m.Term == r.term and there is a leader
-// for that term. see 4th paragraph section 5.2 of the raft paper
-
 // handleCandidateReplicate 处理候选者节点收到的 Replicate 消息（日志复制请求）。
 // 若消息任期与当前任期一致，证明存在合法领导者，候选者退化为跟随者。
-// 参数： - m: 包含日志条目的复制消息
-// 返回值：   - error: 状态转换或日志处理错误
+// 参数：
+//   - m: 包含日志条目的复制消息
+//
+// 返回值：
+//   - error: 状态转换或日志处理错误
 func (r *raft) handleCandidateReplicate(m pb.Message) error {
 	// Raft 论文 5.2 节：若候选者收到领导者的复制请求（任期相同），则退化为跟随者
 	r.becomeFollower(r.term, m.From)
@@ -2348,8 +2988,11 @@ func (r *raft) handleCandidateReplicate(m pb.Message) error {
 
 // handleCandidateInstallSnapshot 处理候选者节点收到的 InstallSnapshot 消息（快照请求）。
 // 若消息任期与当前任期一致，证明存在合法领导者，候选者退化为跟随者。
-// 参数：   - m: 包含快照数据的消息
-// 返回值：  - error: 状态转换或快照处理错误
+// 参数：
+//   - m: 包含快照数据的消息
+//
+// 返回值：
+//   - error: 状态转换或快照处理错误
 func (r *raft) handleCandidateInstallSnapshot(m pb.Message) error {
 	// Raft 论文 5.2 节：若候选者收到领导者的快照请求（任期相同），则退化为跟随者
 	r.becomeFollower(r.term, m.From)
@@ -2358,8 +3001,11 @@ func (r *raft) handleCandidateInstallSnapshot(m pb.Message) error {
 
 // handleCandidateHeartbeat 处理候选者节点收到的 Heartbeat 消息（领导者心跳）。
 // 若消息任期与当前任期一致，证明存在合法领导者，候选者退化为跟随者。
-// 参数：   - m: 包含提交索引的心跳消息
-// 返回值：   - error: 状态转换或心跳处理错误
+// 参数：
+//   - m: 包含提交索引的心跳消息
+//
+// 返回值：
+//   - error: 状态转换或心跳处理错误
 func (r *raft) handleCandidateHeartbeat(m pb.Message) error {
 	// Raft 论文 5.2 节：若候选者收到领导者的心跳（任期相同），则退化为跟随者
 	r.becomeFollower(r.term, m.From)
@@ -2385,18 +3031,14 @@ func (r *raft) handleCandidateRequestVoteResp(m pb.Message) error {
 	plog.Warningf("%s received %d votes and %d rejections, quorum is %d",
 		r.describe(), count, len(r.votes)-count, r.quorum())
 
-	// 3rd paragraph section 5.2 of the raft paper
-
 	// Raft 论文 5.2 节：若获得多数派赞成票，晋升为领导者
 	if count == r.quorum() {
 		if err := r.becomeLeader(); err != nil {
 			return err
 		}
-		// get the NoOP entry committed ASAP
 		// 立即广播复制消息，提交 dummy 条目以确立领导权
 		r.broadcastReplicateMessage()
 	} else if len(r.votes)-count == r.quorum() { // 反对票达法定人数，退化为跟随者
-		// etcd raft does this, it is not stated in the raft paper
 		// 参考 etcd raft 实现：避免候选者长期占用资源，主动退化为跟随者
 		r.becomeFollower(r.term, NoLeader)
 	}
@@ -2432,7 +3074,6 @@ func (r *raft) handlePreVoteCandidateRequestPreVoteResp(m pb.Message) error {
 			return err
 		}
 	} else if len(r.votes)-count == r.quorum() { // 预选举反对票达法定人数，退化为跟随者
-		// etcd raft does this, it is not stated in the raft paper
 		// 参考 etcd raft 实现：避免预选举候选者长期占用资源
 		r.becomeFollower(r.term, NoLeader)
 	}
@@ -2478,37 +3119,17 @@ func (r *raft) reportDroppedReadIndex(m pb.Message) {
 	}
 }
 
-//
-// handler for various message types
-//
-
-// handleHeartbeatMessage 处理收到的心跳消息（由领导者发送），更新本地提交索引并返回心跳响应。
-// 心跳消息是领导者维持领导权的核心机制，通过定期发送包含最新提交索引的心跳，确保跟随者不会因选举超时而发起新选举。
-// 参数：
-//   - m: 接收到的心跳消息，包含领导者的已提交索引（Commit）和可能的系统上下文（Hint/HintHigh，如ReadIndex请求ID）
-//
-// 返回值：
-//   - error: 处理过程中遇到的错误（始终返回nil，心跳处理无失败场景）
 func (r *raft) handleHeartbeatMessage(m pb.Message) error {
-	// 更新本地日志的已提交索引为领导者告知的提交索引，确保数据一致性
 	r.log.commitTo(m.Commit)
-	// 向领导者发送心跳响应，包含原消息的系统上下文（用于ReadIndex等协议确认）
 	r.send(pb.Message{
-		To:       m.From,           // 响应目标为发送心跳的领导者
-		Type:     pb.HeartbeatResp, // 消息类型：心跳响应
-		Hint:     m.Hint,           // 携带原消息的低64位系统上下文（如ReadIndex请求ID）
-		HintHigh: m.HintHigh,       // 携带原消息的高64位系统上下文
+		To:       m.From,
+		Type:     pb.HeartbeatResp,
+		Hint:     m.Hint,
+		HintHigh: m.HintHigh,
 	})
-	return nil // 心跳消息处理成功
+	return nil
 }
 
-// handleInstallSnapshotMessage 处理收到的快照安装请求消息，用于快速同步落后节点的状态。
-// 当跟随者日志落后领导者过多时，领导者会发送快照而非逐条日志，以提高同步效率。
-// 参数：
-//   - m: 包含快照数据的安装请求消息
-//
-// 返回值：
-//   - error: 快照恢复过程中遇到的错误（如快照验证失败、日志操作错误等）
 func (r *raft) handleInstallSnapshotMessage(m pb.Message) error {
 	plog.Debugf("%s called handleInstallSnapshotMessage with snapshot from %s",
 		r.describe(), ReplicaID(m.From))
@@ -2517,19 +3138,17 @@ func (r *raft) handleInstallSnapshotMessage(m pb.Message) error {
 		To:   m.From,
 		Type: pb.ReplicateResp,
 	}
-	// 调用restore方法执行快照恢复，返回是否成功恢复
 	ok, err := r.restore(m.Snapshot)
 	if err != nil {
 		return err
 	}
 	if ok {
 		plog.Debugf("%s restored snapshot %d term %d", r.describe(), index, term)
-		resp.LogIndex = r.log.lastIndex() // 恢复成功，响应中携带当前日志最后索引
+		resp.LogIndex = r.log.lastIndex()
 	} else {
 		plog.Debugf("%s rejected snapshot %d term %d", r.describe(), index, term)
-		resp.LogIndex = r.log.committed // 恢复失败，响应中携带已提交索引
+		resp.LogIndex = r.log.committed
 		if r.events != nil {
-			// 触发快照拒绝事件，用于监控和调试
 			info := server.SnapshotInfo{
 				ShardID:   r.shardID,
 				ReplicaID: r.replicaID,
@@ -2540,54 +3159,38 @@ func (r *raft) handleInstallSnapshotMessage(m pb.Message) error {
 			r.events.SnapshotRejected(info)
 		}
 	}
-	r.send(resp) // 向领导者发送快照处理响应
+	r.send(resp)
 	return nil
 }
 
-// handleReplicateMessage 处理收到的日志复制请求消息，验证日志一致性并追加日志条目。
-// 领导者通过Replicate消息向跟随者复制日志，跟随者需验证日志匹配性后决定是否接受。
 func (r *raft) handleReplicateMessage(m pb.Message) error {
-	// 参数：
-	//   - m: 包含待复制日志条目的请求消息
-	// 返回值：
-	//   - error: 日志复制过程中遇到的错误（如日志匹配失败、条目追加错误等）
 	resp := pb.Message{
 		To:   m.From,
 		Type: pb.ReplicateResp,
 	}
-	// 若基准索引已落后于已提交索引，直接响应已提交索引（无需处理）
 	if m.LogIndex < r.log.committed {
 		resp.LogIndex = r.log.committed
 		r.send(resp)
 		return nil
 	}
-	// 验证基准索引处的日志任期是否匹配（Raft一致性检查）
-	// 即：验证领导者发送的日志条目中，基准索引 m.LogIndex 处的任期是否与跟随者本地日志在同一索引处的任期一致。
-	// m.LogIndex 是领导者开始复制的基准索引，m.LogTerm 是该索引处的任期。
 	ok, err := r.log.matchTerm(m.LogIndex, m.LogTerm)
 	if err != nil {
 		return err
 	}
 	if ok {
-		// 任期匹配，尝试追加日志条目
 		if _, err := r.log.tryAppend(m.LogIndex, m.Entries); err != nil {
 			return err
 		}
-		// 计算追加后的最后索引，并更新提交索引（取追加后索引与领导者提交索引的最小值）
 		lastIdx := m.LogIndex + uint64(len(m.Entries))
 		r.log.commitTo(min(lastIdx, m.Commit))
-		resp.LogIndex = lastIdx // 响应中携带成功追加后的最后索引
-
-	} else { //任期不匹配
-		// ok=false：表示跟随者在 m.LogIndex 处的日志任期与领导者不一致，即出现任期不匹配。
-
+		resp.LogIndex = lastIdx
+	} else {
 		plog.Debugf("%s rejected Replicate index %d term %d from %s",
 			r.describe(), m.LogIndex, m.Term, ReplicaID(m.From))
-		resp.Reject = true            // 标记拒绝复制
-		resp.LogIndex = m.LogIndex    // 携带被拒绝的基准索引（告知领导者冲突发生的索引位置（即领导者发送的基准索引 m.LogIndex），领导者需从此索引开始回溯日志。）
-		resp.Hint = r.log.lastIndex() // 携带本地最后日志索引，帮助领导者调整复制进度（告知领导者跟随者本地日志的最后索引，领导者可根据此值调整 nextIndex（下一次复制的起始索引），避免无效重试。）
+		resp.Reject = true
+		resp.LogIndex = m.LogIndex
+		resp.Hint = r.log.lastIndex()
 		if r.events != nil {
-			// 触发复制拒绝事件，用于监控和调试
 			info := server.ReplicationInfo{
 				ShardID:   r.shardID,
 				ReplicaID: r.replicaID,
@@ -2598,82 +3201,56 @@ func (r *raft) handleReplicateMessage(m pb.Message) error {
 			r.events.ReplicationRejected(info)
 		}
 	}
-	r.send(resp) // 向领导者发送复制结果响应
+	r.send(resp)
 	return nil
 }
 
 //
 // Step related functions
-// 用于消息类型判断的辅助函数，帮助路由和处理不同类型的Raft协议消息
+//
 
-// 判断消息是否为预选举相关消息（请求预投票或预投票响应）
-// PreVote是Raft的优化机制，用于在发起正式选举前确认候选者日志是否足够新，避免网络分区导致的任期膨胀。
 func isPreVoteMessage(t pb.MessageType) bool {
 	return t == pb.RequestPreVote || t == pb.RequestPreVoteResp
 }
 
-// isRequestVoteMessage 判断消息是否为投票请求消息（正式选举请求或预选举请求）。
-// 投票请求是候选者获取集群多数派支持以成为领导者的核心消息类型。
 func isRequestVoteMessage(t pb.MessageType) bool {
 	return t == pb.RequestVote || t == pb.RequestPreVote
 }
 
-// isRequestMessage 判断消息是否为客户端请求类消息（提案、读索引或领导者转移）。
-// 这些消息通常由客户端发起，需要领导者处理或由跟随者转发给领导者。
 func isRequestMessage(t pb.MessageType) bool {
 	return t == pb.Propose || t == pb.ReadIndex || t == pb.LeaderTransfer
 }
 
-// isLeaderMessage 判断消息是否为领导者发送的消息（日志复制、快照安装、心跳等）。
-// 领导者通过这些消息维护集群状态一致性、同步日志并维持领导权。
 func isLeaderMessage(t pb.MessageType) bool {
 	return t == pb.Replicate || t == pb.InstallSnapshot ||
 		t == pb.Heartbeat || t == pb.TimeoutNow || t == pb.ReadIndexResp
 }
 
-// 判断是否应丢弃来自高任期节点的投票请求（RequestVote）
-// 用于减少网络分区节点因高任期发起不必要的选举，保护当前领导的稳定性（参考 Raft 论文 6 节最后一段）
 func (r *raft) dropRequestVoteFromHighTermNode(m pb.Message) bool {
-	//参数：m:待检查的投票请求信息
-	// 返回：bool: true 表示丢弃该投票请求，false 表示允许处理
-
-	// 1.非投票请求消息、未启用quorum检查、 消息任期不高于本地任期 ：不丢弃
 	if !isRequestVoteMessage(m.Type) || !r.checkQuorum || m.Term <= r.term {
 		return false
 	}
 	// see p42 of the raft thesis
-	// 领导者转移的投票请求（m.Hint == m.From ）： 不丢弃
-	// 为什么是m.Hint == m.From ：
-	// 领导者转移是一种主动、受控的领导权交接过程（非故障触发的被动选举）。例如，当前领导者因负载过高或维护需求，需将领导权交给集群中其他节点。此时：
-	// 转移发起者（原领导者）会向目标节点发送 RequestVote 请求，且必须确保该请求不被目标节点的安全过滤逻辑丢弃。
-	// 	通过设置 Hint = From（即 Hint 字段等于原领导者的节点 ID），目标节点可识别这是领导者主动发起的转移请求，而非网络分区节点的干扰请求。
 	if m.Hint == m.From {
 		plog.Debugf("%s, RequestVote with leader transfer hint received from %s",
 			r.describe(), ReplicaID(m.From))
 		return false
 	}
-
-	// 领导者节点的选举计时器不应该超时，若超时则触发panic
 	if r.isLeader() && !r.quiesce && r.electionTick >= r.electionTimeout {
 		panic("r.electionTick >= r.electionTimeout on leader")
 	}
-	// we got a RequestVote with higher term, but we recently had heartbeat msg from leader within the minimum election timeout and that leader is known to have quorum. we thus drop such RequestVote to minimize interruption by network partitioned nodes with higher term.
+	// we got a RequestVote with higher term, but we recently had heartbeat msg
+	// from leader within the minimum election timeout and that leader is known
+	// to have quorum. we thus drop such RequestVote to minimize interruption by
+	// network partitioned nodes with higher term.
 	// this idea is from the last paragraph of the section 6 of the raft paper
-	// 我们收到了一个任期更高的 RequestVote 请求，但我们最近在最小选举超时时间内收到了来自领导者的 heartbeat 消息，并且该领导者已知拥有法定人数。因此我们丢弃这样的 RequestVote，以最小化网络分区节点带来的干扰。
-	// 这个想法来自 Raft 论文第 6 节最后一段
-
-	// 若近期（选举超时内）收到过领导者心跳，且领导者已知存在 ： 丢弃
-	// 避免网络分区节点携带高任期干扰正常集群   “任期膨胀”  （参考 Raft 论文 6 节安全优化）。
 	if r.leaderID != NoLeader && r.electionTick < r.electionTimeout {
 		return true
 	}
 	return false
 }
 
-// 判断消息是否为预期的高任期预选举相关消息
-// 用于在任期不匹配处理中 识别合法的预选举消息，避免错误地更新本地任期
 func isPreVoteMessageWithExpectedHigherTerm(m pb.Message) bool {
-	//   - bool: true 表示是预选举请求，或未被拒绝的预选举响应（预期的高任期消息）
 	return m.Type == pb.RequestPreVote ||
 		(m.Type == pb.RequestPreVoteResp && !m.Reject)
 }
@@ -2682,141 +3259,91 @@ func isPreVoteMessageWithExpectedHigherTerm(m pb.Message) bool {
 // message has a term value different from local node's term. it returns a
 // boolean flag indicating whether the message should be ignored.
 // see the 3rd paragraph, section 5.1 of the raft paper for details.
-// 处理入站消息任期与本地节点任期不匹配的情况。
-// 根据 Raft 协议 5.1 节第三段，节点需根据消息任期更新自身状态（如转为跟随者），并决定是否忽略消息。包括：
-// - 忽略任期为0或相等的消息；
-// - 拒绝来自高任期节点的 RequestVote 消息（在特定条件下）；
-// - 当消息任期更高时，将节点状态转换为 Follower 或其他角色；
-// - 当消息任期更低时，忽略或发送 NoOP 回复。
-// 返回值:
-//   - bool: 如果消息被忽略或丢弃，返回 true；否则返回 false。
 func (r *raft) onMessageTermNotMatched(m pb.Message) bool {
-
-	// if 消息任期为 0（无效）或与本地任期一致，无需处理
 	if m.Term == 0 || m.Term == r.term {
 		return false
 	}
-
-	// if消息为投票请求且来自高任期节点（如果配置允许）
 	if r.dropRequestVoteFromHighTermNode(m) {
 		plog.Warningf("%s dropped RequestVote at term %d from %s, leader available",
 			r.describe(), m.Term, ReplicaID(m.From))
-		return true //丢弃
+		return true
 	}
-
-	// if消息任期高于本地任期：更新本地任期并转为对应角色
 	if m.Term > r.term {
-
-		// 忽略预选举相关的高任期消息（预选举不更新任期）
-
-		// 如果不是预期的预投票消息，则进行角色转换
 		if !isPreVoteMessageWithExpectedHigherTerm(m) {
 			plog.Warningf("%s received %s with higher term (%d) from %s",
 				r.describe(), m.Type, m.Term, ReplicaID(m.From))
 			leaderID := NoLeader
-			// 若为领导者消息，记录发送者为新领导者
 			if isLeaderMessage(m.Type) {
 				leaderID = m.From
 			}
-
-			// 根据当前节点类型更新状态（非投票节点/见证节点/普通节点）
 			if r.isNonVoting() {
 				r.becomeNonVoting(m.Term, leaderID)
 			} else if r.isWitness() {
 				r.becomeWitness(m.Term, leaderID)
 			} else {
-				// 对投票请求特殊处理，避免重置选举计时器导致无法发起选举
 				if m.Type == pb.RequestVote {
-					plog.Warningf("%s become followerKE after receiving higher term from %s", r.describe(), ReplicaID(m.From))
-					// not to reset the electionTick value to avoid the risk of having the local node not being to campaign at all. if the local node generates the tick much slower than other nodes (e.g. bad config, hardware clock issue, bad scheduling, overloaded etc.), it may lose the chance to ever start a campaign unless we keep its electionTick value here.
-
-					// 不重置 electionTick 以避免本地节点无法发起选举的风险
-					r.becomeFollowerKE(m.Term, leaderID) // 保留选举计时器的跟随者状态
+					plog.Warningf("%s become followerKE after receiving higher term from %s",
+						r.describe(), ReplicaID(m.From))
+					// not to reset the electionTick value to avoid the risk of having the
+					// local node not being to campaign at all. if the local node generates
+					// the tick much slower than other nodes (e.g. bad config, hardware
+					// clock issue, bad scheduling, overloaded etc.), it may lose the chance
+					// to ever start a campaign unless we keep its electionTick value here.
+					r.becomeFollowerKE(m.Term, leaderID)
 				} else {
-					plog.Warningf("%s become follower after receiving higher term from %s", r.describe(), ReplicaID(m.From))
-					r.becomeFollower(m.Term, leaderID) // 普通跟随者状态
+					plog.Warningf("%s become follower after receiving higher term from %s",
+						r.describe(), ReplicaID(m.From))
+					r.becomeFollower(m.Term, leaderID)
 				}
 			}
 		}
-		// 消息任期低于本地任期：忽略大部分消息，仅响应预选举或领导者消息（维持集群稳定性）
 	} else if m.Term < r.term {
-
 		if m.Type == pb.RequestPreVote ||
 			(isLeaderMessage(m.Type) && (r.checkQuorum || r.preVote)) {
 			// see test TestFreeStuckCandidateWithCheckQuorum for details
-
-			// 响应预选举或领导者消息，避免候选者因网络分区卡死（参考 TestFreeStuckCandidateWithCheckQuorum）
-
-			// 对于预投票或特定条件下的领导消息，发送 NoOP 回复
 			r.send(pb.Message{To: m.From, Type: pb.NoOP})
-
 		} else {
-			// 其他低任期消息直接忽略
 			plog.Infof("%s ignored %s with lower term (%d) from %s",
 				r.describe(), m.Type, m.Term, ReplicaID(m.From))
 		}
-		return true // 低任期消息无需进一步处理
+		return true
 	}
 	return false
 }
 
-// 检查当前Raft配置是否与消息类型冲突
 func (r *raft) inconsistentRaftConfig(m pb.Message) bool {
-	// 预选举false即节点未启用预选举功能 且 消息m是预选举消息 则返回true 表示配置不一致
-	// 否则 返回false
 	return !r.preVote && isPreVoteMessage(m.Type)
 }
 
-// Handle 是 Raft 节点的消息处理入口，负责消息的合法性校验、任期匹配处理及路由至对应状态的处理器。
-// 参数：
-//   - m: 待处理的网络消息
-//
-// 返回值：
-//   - error: 处理过程中遇到的错误（如配置冲突导致的 panic）
 func (r *raft) Handle(m pb.Message) error {
-
-	// 配置冲突检查：禁用预选举时收到预选举消息，触发 panic
 	if r.inconsistentRaftConfig(m) {
 		panic("received preVote message when preVote is not enabled")
 	}
-
-	// 处理任期不匹配：若未忽略消息且非预选举消息，二次检查任期一致性
 	if !r.onMessageTermNotMatched(m) {
 		if !isPreVoteMessage(m.Type) {
-			r.doubleCheckTermMatched(m.Term) // 防御性任期校验，避免状态不一致
+			r.doubleCheckTermMatched(m.Term)
 		}
-		return r.handle(r, m) // 路由至状态专用处理器
+		return r.handle(r, m)
 	}
 	plog.Infof("%s dropped %s from %s, term %d, term not matched",
 		r.describe(), m.Type, ReplicaID(m.From), m.Term)
 	return nil
 }
 
-// hasConfigChangeToApply 检查是否存在已提交但未应用的配置变更条目。
-// Raft 安全要求：同一时间仅允许一个未应用的配置变更，避免新旧 quorum 无重叠导致的安全性问题。
-// 返回值：
-//   - bool: true 表示存在未应用的配置变更，false 表示所有已提交配置变更均已应用
 func (r *raft) hasConfigChangeToApply() bool {
 	// this is a hack to make it easier to port etcd raft tests
 	// check those *_etcd_test.go for details
-
-	// 适配 etcd raft 测试的兼容逻辑（实际应扫描已提交未应用的日志条目）
 	if r.hasNotAppliedConfigChange != nil {
 		return r.hasNotAppliedConfigChange()
 	}
 	// TODO:
-	// with the current entry log implementation, the simplification below is no longer required, we can now actually scan the committed but not applied portion of the log as they are now all in memory.
-	// 在当前的日志条目实现中，以下简化不再需要，我们现在实际上可以扫描已提交但未应用的日志部分，因为它们现在都在内存中。
-
-	// 简化判断：若已提交索引大于已应用索引，则认为存在未应用配置变更
+	// with the current entry log implementation, the simplification below is no
+	// longer required, we can now actually scan the committed but not applied
+	// portion of the log as they are now all in memory.
 	return r.log.committed > r.getApplied()
 }
 
-// canGrantVote 判断是否可以授予投票给请求者。
-//   - m: 投票请求消息
 func (r *raft) canGrantVote(m pb.Message) bool {
-	// 根据 Raft 协议 5.2 节第三段：仅当未投票、已投票给请求者或请求者任期更高时，才可能授予投票。
-	//   - bool: true 表示可授予投票，false 表示不可授予
 	return r.vote == NoNode || r.vote == m.From || m.Term > r.term
 }
 
@@ -2824,18 +3351,18 @@ func (r *raft) canGrantVote(m pb.Message) bool {
 // handlers for nodes in any state
 //
 
-// handleNodeElection 函数，属于 Raft 节点在任意状态下处理选举触发消息的核心逻辑，主要用于决定节点是否发起选举（预选举或正式选举），并确保选举过程符合 Raft 协议的安全性要求。
 func (r *raft) handleNodeElection(m pb.Message) error {
-	// 若当前节点已是领导者，忽略选举请求（领导者无需参与选举）
-	// 非领导者 进入下面步骤
 	if !r.isLeader() {
-		// there can be multiple pending membership change entries committed but not applied on this node. say with a shard of X, Y and Z, there are two such entries for adding node A and B are committed but not applied available on X. If X is allowed to start a new election, it can become the leader with a vote from any one of the node Y or Z. Further proposals made by the new leader X in the next term will require a quorum of 2 which can have no overlap with the committed quorum of 3. this violates the safety requirement of raft.
-		// ignore the Election message when there is membership configure change committed but not applied
-		// 当前节点已提交但尚未应用的配置变更条目可能有多个。例如，对于一个由 X、Y 和 Z 组成的分片，有两个提交但尚未在 X 节点上应用的添加节点 A 和 B 的条目。如果允许 X 发起新的选举，它可能通过获得 Y 或 Z 中任一节点的投票而成为领导者。新领导者 X 在下一个任期中所做的进一步提案将需要 2 个节点的法定人数，而这可能与原有的 3 个节点的已提交法定人数没有重叠。这违反了 Raft 的安全性要求。
-		// 当存在已提交但尚未应用的成员配置变更时，忽略选举消息
-
-		// 1. 检查是否有未应用的配置变更，若有则跳过选举
-		// 安全背景：Raft 成员变更需保证“新旧配置的 quorum 重叠”（一次仅允许一个未应用变更）。若存在未应用的配置变更时发起选举，新领导者可能使用错误的 quorum 规则，导致数据不一致（例如旧配置 3 节点 quorum=2，新配置 4 节点 quorum=3，若两者未重叠可能导致提交不安全）。
+		// there can be multiple pending membership change entries committed but not
+		// applied on this node. say with a shard of X, Y and Z, there are two
+		// such entries for adding node A and B are committed but not applied
+		// available on X. If X is allowed to start a new election, it can become the
+		// leader with a vote from any one of the node Y or Z. Further proposals made
+		// by the new leader X in the next term will require a quorum of 2 which can
+		// have no overlap with the committed quorum of 3. this violates the safety
+		// requirement of raft.
+		// ignore the Election message when there is membership configure change
+		// committed but not applied
 		if r.hasConfigChangeToApply() {
 			plog.Warningf("%s campaign skipped, pending config change",
 				r.describe())
@@ -2845,140 +3372,93 @@ func (r *raft) handleNodeElection(m pb.Message) error {
 					ReplicaID: r.replicaID,
 					Term:      r.term,
 				}
-				r.events.CampaignSkipped(info) // 触发“选举跳过”事件（供监控）
+				r.events.CampaignSkipped(info)
 			}
 			return nil
 		}
-		// prevote is enabled, but the user explicitly requested the leadership to be transferred, so skip the pre-vote stage
-		// 预选举已启用，但用户明确请求进行领导权转移，因此跳过预选举阶段
-
-		// 2. 若启用预选举且非领导者转移目标，发起预选举
-		// r.preVote：节点启用了预选举机制（Raft 优化，避免网络分区节点通过“任期膨胀”夺取领导权）。
-		// !r.isLeaderTransferTarget：当前节点不是领导者转移的目标节点（领导者转移是主动交接领导权的过程，无需预选举）。
+		// prevote is enabled, but the user explicitly requested the leadership to
+		// be transferred, so skip the pre-vote stage
 		if r.preVote && !r.isLeaderTransferTarget {
 			plog.Debugf("%s will start a preVote campaign", r.describe())
-			// 行为：调用 r.preVoteCampaign() 发起预选举，先向集群确认自身日志是否足够新，再决定是否发起正式选举。
-			return r.preVoteCampaign() // 预选举：先确认日志是否足够新，避免任期膨胀
+			return r.preVoteCampaign()
 		}
-		// 3. 否则发起正式选举
-		// 不满足预选举条件时（如禁用预选举，或作为领导者转移目标），直接调用 r.campaign() 发起正式选举，向集群节点发送投票请求（RequestVote）。
 		plog.Debugf("%s will start a campaign", r.describe())
-		return r.campaign() // 正式选举：直接向集群请求投票
+		return r.campaign()
 	}
-	// 领导者忽略选举请求
-	// 原因：Raft 协议中，领导者通过定期发送心跳维持领导权，无需参与选举，避免集群内出现多领导者竞争。
 	plog.Debugf("%s is leader, ignored Election", r.describe())
 	return nil
 }
 
-// 处理预投票请求
-// 作用：响应其他节点的预选举请求（RequestPreVote），决定是否授予预投票。
-// 预选举（PreVote）是 Raft 的优化机制，用于避免网络分区节点通过“任期膨胀”夺取领导权，仅当候选者日志足够新时才允许其发起正式选举。
 func (r *raft) handleNodeRequestPreVote(m pb.Message) error {
-
-	resp := pb.Message{ //构建预投票响应
-		To:   m.From,                //响应目标为请求者
-		Type: pb.RequestPreVoteResp, //消息类型：预投票响应
+	resp := pb.Message{
+		To:   m.From,
+		Type: pb.RequestPreVoteResp,
 	}
-
-	// 检查候选者日志是否“足够新”（Raft 论文 5.4 节：日志较新的节点更适合成为领导者）
-	// 需满足候选者日志的最后索引和任期不落后于本地日志
 	isUpToDate, err := r.log.upToDate(m.LogIndex, m.LogTerm)
 	if err != nil {
 		return err
 	}
-
-	// 预投票拒绝条件：候选者任期 < 本地任期（理论上不应发生，直接 panic）（预投票请求的任期应不低于接收者任期）。
-
 	if m.Term < r.term {
 		panic("m.term < r.term")
 	}
-
-	// 授予预投票的条件：候选者任期 > 本地任期，且日志足够新
-
 	if m.Term > r.term && isUpToDate {
-		resp.Term = m.Term // 响应携带候选者的高任期
+		resp.Term = m.Term
 		plog.Warningf("%s cast preVote from %s index %d term %d, log term: %d",
 			r.describe(), ReplicaID(m.From), m.LogIndex, m.Term, m.LogTerm)
 	} else {
-		// 拒绝预投票：候选者任期 <= 本地任期，或日志不新
-
 		// m.Term == r.term || !isUpToDate
 		plog.Warningf("%s rejected preVote %s index %d term %d,logterm %d, utd %t",
 			r.describe(), ReplicaID(m.From), m.LogIndex, m.Term, m.LogTerm, isUpToDate)
-		resp.Term = r.term // 响应携带本地任期
-		resp.Reject = true // 标记拒绝
+		resp.Term = r.term
+		resp.Reject = true
 	}
-	r.send(resp) // 发送预投票响应
-
-	// 预投票不改变本地状态：与正式投票不同，预投票仅确认候选者资格，不记录投票状态（r.vote 无更新），避免干扰后续正式选举。
-
+	r.send(resp)
 	return nil
 }
 
-// 处理正式投票请求
-// 作用：响应其他节点的正式选举请求（RequestVote），决定是否授予投票。这是 Raft 协议中候选者获取领导权的核心步骤，需严格遵循“一人一票”和“日志较新”原则。
-// 关键细节：
-// 投票条件：需同时满足 canGrant（投票权检查）和 isUpToDate（日志新鲜度检查）：
-// canGrant：通过 r.canGrantVote(m) 实现，逻辑为 r.vote == NoNode || r.vote == m.From || m.Term > r.term（未投票、投给同一人，或请求者任期更高）。
-// isUpToDate：同预投票，确保请求者日志不落后于本地。
-// 状态更新：授予投票后，重置 electionTick（避免自身因选举超时而发起新选举），并记录 r.vote = m.From（确保任期内仅投一次票）。
 func (r *raft) handleNodeRequestVote(m pb.Message) error {
-	resp := pb.Message{ // 构建投票响应
-		To:   m.From,             // 响应目标为请求者
-		Type: pb.RequestVoteResp, // 消息类型：投票响应
+	resp := pb.Message{
+		To:   m.From,
+		Type: pb.RequestVoteResp,
 	}
-
 	// 3rd paragraph section 5.2 of the raft paper
-	// 检查是否“可授予投票”（Raft 论文 5.2 节）：未投票、已投给请求者，或请求者任期更高
 	canGrant := r.canGrantVote(m)
-
 	// 2nd paragraph section 5.4 of the raft paper
-	// 检查请求者日志是否“足够新”（Raft 论文 5.4 节）
 	isUpToDate, err := r.log.upToDate(m.LogIndex, m.LogTerm)
 	if err != nil {
 		return err
 	}
-
-	// 授予投票：满足可投票条件且日志足够新
 	if canGrant && isUpToDate {
 		plog.Warningf("%s cast vote from %s index %d term %d, log term: %d",
 			r.describe(), ReplicaID(m.From), m.LogIndex, m.Term, m.LogTerm)
-		r.electionTick = 0 // 重置选举计时器（避免立即发起新选举）
-		r.vote = m.From    // 记录投票给请求者(m.From)（“一人一票”原则）
-	} else { // 拒绝投票
+		r.electionTick = 0
+		r.vote = m.From
+	} else {
 		plog.Warningf("%s rejected vote %s index%d term%d,logterm%d,grant%v,utd%v",
 			r.describe(), ReplicaID(m.From), m.LogIndex, m.Term,
 			m.LogTerm, canGrant, isUpToDate)
-		resp.Reject = true // 标记拒绝
+		resp.Reject = true
 	}
-	r.send(resp) // 发送投票响应
+	r.send(resp)
 	return nil
 }
 
-// 处理配置变更事件
-
-// 作用：应用已提交的集群配置变更（如添加/移除节点、变更节点角色），是 Raft 成员变更协议的核心实现，确保配置更新过程中集群仍能维持可用性和一致性。
-// 配置变更类型：通过 m.HintHigh 传递，对应 pb.ConfigChangeType 枚举（如 AddNode/RemoveNode），目标节点 ID 由 m.Hint 传递。
-// 安全性保障：Raft 要求配置变更需“逐条提交”（一次仅允许一个未应用变更），避免新旧配置 quorum 无重叠导致的数据不一致（通过 hasConfigChangeToApply 检查）。
-// 角色区分：支持多种节点角色（投票成员/非投票成员/见证成员），适配不同场景（如新节点预热、轻量级 quorum 节点）。
 func (r *raft) handleNodeConfigChange(m pb.Message) error {
-	if m.Reject { // 配置变更被拒绝：清除待处理变更
+	if m.Reject {
 		r.clearPendingConfigChange()
-	} else { // 配置变更通过：解析类型并应用
-		cctype := (pb.ConfigChangeType)(m.HintHigh) // 从 HintHigh 获取变更类型（如 AddNode）
-		nodeid := m.Hint                            // 从 Hint 获取目标节点 ID
-
+	} else {
+		cctype := (pb.ConfigChangeType)(m.HintHigh)
+		nodeid := m.Hint
 		switch cctype {
-		case pb.AddNode: // 添加投票成员
+		case pb.AddNode:
 			r.addNode(nodeid)
-		case pb.RemoveNode: // 移除投票成员
+		case pb.RemoveNode:
 			if err := r.removeNode(nodeid); err != nil {
 				return err
 			}
-		case pb.AddNonVoting: // 添加非投票成员（仅同步日志，无投票权）
+		case pb.AddNonVoting:
 			r.addNonVoting(nodeid)
-		case pb.AddWitness: // 添加见证成员（仅参与 quorum 计算，不存储完整日志）
+		case pb.AddWitness:
 			r.addWitness(nodeid)
 		default:
 			panic("unexpected config change type")
@@ -2987,43 +3467,30 @@ func (r *raft) handleNodeConfigChange(m pb.Message) error {
 	return nil
 }
 
-// 处理日志查询请求
-// 作用：响应其他节点或客户端的日志查询请求，获取指定范围内已提交的日志条目，用于数据同步或审计。
 func (r *raft) handleLogQuery(m pb.Message) error {
-
-	// // 确保当前无未处理的日志查询结果（避免并发查询冲突）
 	if r.logQueryResult == nil {
 		entries, err := r.log.getCommittedEntries(m.From, m.To, m.Hint)
-		// 构建查询结果，包含日志范围、错误信息和条目数据
 		r.logQueryResult = &pb.LogQueryResult{
-			FirstIndex: r.log.firstIndex(),  // 本地日志的起始索引
-			LastIndex:  r.log.committed + 1, // 已提交索引的下一个位置（即未提交的起始点）
-			Error:      err,                 // 查询过程中的错误（如索引越界）
-			Entries:    entries,             // 查询到的已提交日志条目
+			FirstIndex: r.log.firstIndex(),
+			LastIndex:  r.log.committed + 1,
+			Error:      err,
+			Entries:    entries,
 		}
 	} else {
-		// 若已有未处理的查询结果，直接 panic（防止重复查询导致状态混乱）
 		panic("log query result is not nil")
 	}
 	return nil
 }
 
-// 处理本地定时任务
-// 作用：响应节点内部的定时触发消息（LocalTick），根据节点状态执行不同的定时逻辑（如选举超时检查、领导者心跳触发）。
 func (r *raft) handleLocalTick(m pb.Message) error {
-	// // 若消息标记为“拒绝”（Reject=true），执行“静默状态”定时任务
 	if m.Reject {
 		r.quiescedTick()
 		return nil
 	}
-	// // 否则执行常规定时任务（如选举超时检查、领导者心跳）
 	return r.tick()
 }
 
-// 处理远程快照恢复
-// 作用：接收并应用远程节点发送的快照数据，快速同步节点状态（当本地日志落后领导者过多时，通过快照而非逐条日志同步，提升效率）。
 func (r *raft) handleRestoreRemote(m pb.Message) error {
-	// 调用 restoreRemotes 方法，使用消息中的快照数据恢复节点状态
 	r.restoreRemotes(m.Snapshot)
 	return nil
 }
@@ -3032,156 +3499,97 @@ func (r *raft) handleRestoreRemote(m pb.Message) error {
 // message handler functions used by leader
 //
 
-// 广播心跳维持领导权
-// 作用：响应心跳触发消息（通常由定时任务调用），向集群所有节点广播心跳消息，维持领导者身份。
 func (r *raft) handleLeaderHeartbeat(m pb.Message) error {
-	// broadcastHeartbeatMessage：内部实现向集群所有节点广播 Heartbeat 消息，携带领导者的当前提交索引（Commit），供跟随者更新本地提交状态。
-	r.broadcastHeartbeatMessage() // 向所有跟随者/非投票成员/见证成员发送心跳
+	r.broadcastHeartbeatMessage()
 	return nil
 }
 
-// 检查领导者是否仍拥有 Quorum
-// 作用：验证领导者是否仍获得集群多数派（Quorum）支持，若失去 Quorum 则主动退化为跟随者，避免“孤领导者”导致的数据不一致。
-// p69 of the raft thesis （参考 Raft 论文 6.3 节“领导者失效检测”）
+// p69 of the raft thesis
 func (r *raft) handleLeaderCheckQuorum(m pb.Message) error {
-	r.mustBeLeader()          // 确保当前节点是领导者（防御性检查）
-	if !r.leaderHasQuorum() { // 检查是否仍与多数派节点保持通信
+	r.mustBeLeader()
+	if !r.leaderHasQuorum() {
 		plog.Warningf("%s has lost quorum", r.describe())
-		r.becomeFollower(r.term, NoLeader) // 失去 Quorum，退化为跟随者
+		r.becomeFollower(r.term, NoLeader)
 	}
 	return nil
 }
 
-// 处理客户端提案（核心写逻辑）
-// 作用：接收并处理客户端提交的提案（如数据写入请求），确保提案在集群中安全复制并提交，是 Raft 一致性算法的核心写路径。
 func (r *raft) handleLeaderPropose(m pb.Message) error {
-	r.mustBeLeader() // 仅领导者可处理提案
-
-	// 1. 若正在进行领导者转移，丢弃提案（避免转移期间数据不一致）
-	// 领导者转移（Leadership Transfer）是主动交接过程，期间处理提案可能导致数据丢失，因此暂时拒绝新提案。
+	r.mustBeLeader()
 	if r.leaderTransfering() {
 		plog.Warningf("%s dropped proposal, leader transferring", r.describe())
-		r.reportDroppedProposal(m) // 记录丢弃事件（供监控/重试）
+		r.reportDroppedProposal(m)
 		return nil
 	}
-
-	// 2. 处理配置变更提案（确保同一时间仅一个未完成的配置变更）
-
 	for i, e := range m.Entries {
-		if e.Type == pb.ConfigChangeEntry { // 检测配置变更条目
-			if r.hasPendingConfigChange() { // 存在未完成的配置变更
+		if e.Type == pb.ConfigChangeEntry {
+			if r.hasPendingConfigChange() {
 				plog.Warningf("%s dropped config change, pending change", r.describe())
-				r.reportDroppedConfigChange(m.Entries[i]) // 【记录】丢弃的配置变更
-				// Raft协议要求同一时间只能有一个未提交的配置变更条目
-				// 如果已经有未提交的配置变更，新的配置变更请求需要被丢弃
-				m.Entries[i] = pb.Entry{Type: pb.ApplicationEntry} // 替换为普通条目【这一步是真正的丢弃】
-				// 虽然配置变更被丢弃，但仍需在日志中保留一个占位条目
-				// 将其替换为普通应用条目(ApplicationEntry)，避免破坏日志结构
+				r.reportDroppedConfigChange(m.Entries[i])
+				m.Entries[i] = pb.Entry{Type: pb.ApplicationEntry}
 			}
-			r.setPendingConfigChange() // 标记存在待处理的配置变更
+			r.setPendingConfigChange()
 		}
 	}
-
-	// 3. 追加提案条目到本地日志
-
 	if err := r.appendEntries(m.Entries); err != nil {
 		return err
 	}
-
-	// 4. 广播日志复制消息，要求跟随者复制新条目
-
 	r.broadcastReplicateMessage()
 	return nil
 }
 
-// 验证当前任期是否有已提交条目
-// 作用：检查领导者本地日志中是否存在当前任期内已提交的条目，是 ReadIndex 协议（线性一致性读）的前置条件（参考 Raft 论文 6.4 节）。
-// 为何需要此检查？
-// 新当选的领导者可能尚未提交任何条目（如刚选举成功但未处理提案），此时直接响应读请求可能返回旧数据。ReadIndex 协议要求领导者必须有当前任期的已提交条目，确保其已获得多数派认可，从而安全地提供线性一致的读结果。
-// p72 of the raft thesis （Raft 论文 6.4 节“只读操作优化”）
+// p72 of the raft thesis
 func (r *raft) hasCommittedEntryAtCurrentTerm() bool {
-
-	if r.term == 0 { // 任期 0 无效，防御性 panic
+	if r.term == 0 {
 		panic("not suppose to reach here")
 	}
-	//  // 获取最后提交条目的任期
 	lastCommittedTerm, err := r.log.term(r.log.committed)
-	if err != nil && !errors.Is(err, ErrCompacted) { // 忽略日志压缩错误
+	if err != nil && !errors.Is(err, ErrCompacted) {
 		plog.Panicf("%s failed to get term, %v", r.describe(), err)
 	}
-	// 验证是否为当前任期
 	return lastCommittedTerm == r.term
 }
 
-// 清空可读请求队列
-// 维护 readyToRead 列表，记录已满足线性一致性条件的读请求索引及上下文，供客户端读取时使用。
 func (r *raft) clearReadyToRead() {
 	r.readyToRead = r.readyToRead[:0]
 }
 
-// 添加可读请求到队列（记录已提交索引和系统上下文）
-// 使用场景：当领导者通过 ReadIndex 协议确认某个索引已被多数派提交后，
-// 调用 addReadyToRead 将该索引及请求上下文加入队列，
-// 客户端随后可安全读取对应数据。
-// clearReadyToRead 用于批量处理完成后清空队列，避免重复处理。
 func (r *raft) addReadyToRead(index uint64, ctx pb.SystemCtx) {
 	r.readyToRead = append(r.readyToRead,
 		pb.ReadyToRead{
-			Index:     index, // 已提交的日志索引（客户端需读取此索引之后的数据）
-			SystemCtx: ctx,   // 请求上下文（如客户端 ID、请求 ID 等元数据）
+			Index:     index,
+			SystemCtx: ctx,
 		})
 }
 
-// 处理线性一致性读请求
-// 作用：实现 Raft 论文 6.4 节定义的 ReadIndex 协议，确保领导者返回的数据是集群中已提交的最新状态（线性一致性读），避免因网络分区或日志未同步导致的“脏读”。
-/*
-ReadIndex 协议流程（非单节点集群）：
-
-	检查提交状态：通过 hasCommittedEntryAtCurrentTerm() 确保领导者在当前任期有已提交的日志（避免新当选领导者因未提交日志而返回旧数据）。
-	记录读请求：将当前已提交索引（log.committed）和请求上下文加入 readIndex 队列。
-	广播心跳确认：发送带上下文的心跳（broadcastHeartbeatMessageWithHint），要求跟随者响应以确认它们已同步到该提交索引。
-	多数派确认后响应：当收到多数派（Quorum）跟随者的心跳响应后，领导者将该提交索引标记为“可读”，客户端即可安全读取对应数据。
-特殊节点处理：
-
-	见证节点（Witness）：仅参与 Quorum 计算，不存储完整日志，因此直接丢弃读请求。
-	单节点集群：无需多数派确认，直接使用本地已提交索引响应。
-*/
 // section 6.4 of the raft thesis
 func (r *raft) handleLeaderReadIndex(m pb.Message) error {
-	r.mustBeLeader() // 仅领导者可处理读请求
+	r.mustBeLeader()
 	ctx := pb.SystemCtx{
 		High: m.HintHigh,
 		Low:  m.Hint,
-	} // 提取请求上下文（如客户端元数据）
-	// 1. 见证节点（Witness）不参与数据读取，直接丢弃请求
+	}
 	if _, wok := r.witnesses[m.From]; wok {
 		plog.Errorf("%s dropped ReadIndex, witness node %d", r.describe(), m.From)
-
-		//  2. 非单节点集群（需多数派确认）
 	} else if !r.isSingleNodeQuorum() {
-		// 检查当前任期是否有已提交的日志条目（ReadIndex 协议前置条件）
 		if !r.hasCommittedEntryAtCurrentTerm() {
 			// leader doesn't know the commit value of the shard
-			// see raft thesis section 6.4, this is the first step of the ReadIndex protocol.
+			// see raft thesis section 6.4, this is the first step of the ReadIndex
+			// protocol.
 			plog.Warningf("%s dropped ReadIndex, not ready", r.describe())
 			r.reportDroppedReadIndex(m)
 			return nil
 		}
-		// 添加读请求到队列，记录当前已提交索引（log.committed）和请求上下文
 		r.readIndex.addRequest(r.log.committed, ctx, m.From)
-		// 广播带上下文的心跳消息，要求跟随者确认已提交索引
 		r.broadcastHeartbeatMessageWithHint(ctx)
-		// 3. 单节点集群（无需多数派确认，直接读取）
 	} else {
-		// 将已提交索引加入可读队列（供客户端读取）
 		r.addReadyToRead(r.log.committed, ctx)
-		// 若请求来自非投票节点，直接发送读响应
 		_, ook := r.nonVotings[m.From]
 		if m.From != r.replicaID && ook {
 			r.send(pb.Message{
 				To:       m.From,
 				Type:     pb.ReadIndexResp,
-				LogIndex: r.log.committed, // 已提交索引（客户端需读取此索引后的数据）
+				LogIndex: r.log.committed,
 				Hint:     m.Hint,
 				HintHigh: m.HintHigh,
 				Commit:   m.Commit,
@@ -3191,232 +3599,138 @@ func (r *raft) handleLeaderReadIndex(m pb.Message) error {
 	return nil
 }
 
-// 处理日志复制响应
-// 作用：接收跟随者对日志复制消息（Replicate）的响应，更新跟随者的复制状态，尝试提交日志条目，并处理领导者转移（Leadership Transfer）逻辑。
-
-/*
-复制状态更新：
-
-rp.tryUpdate(m.LogIndex)：更新跟随者 rp 的 match 字段（已成功复制的最大日志索引），仅当响应中的 LogIndex 大于当前 match 时生效。
-r.tryCommit()：检查是否多数派跟随者已复制当前领导者的最新日志条目，若是则更新 log.committed（全局提交索引），确保所有节点最终同步到此状态。
-领导者转移触发：
-当领导者主动转移领导权给目标节点（leaderTransferTarget），且目标节点已复制所有日志（log.lastIndex() == rp.match）时，发送 TimeoutNowMessage() 触发目标节点立即发起选举，加速领导权交接。
-
-复制冲突处理:
-若跟随者因日志不一致拒绝复制（m.Reject == true），通过 rp.decreaseTo()将跟随者的next` 索引回退至其日志匹配点+1，并进入重试状态重新发送日志，确保最终一致性。
-*/
 func (r *raft) handleLeaderReplicateResp(m pb.Message, rp *remote) error {
-	r.mustBeLeader() // 仅领导者可处理复制响应
-	rp.setActive()   // 标记该跟随者状态为“活跃”（避免被判定为不可达）
-	if !m.Reject {   // 复制成功（未被跟随者拒绝）
-		paused := rp.isPaused() // 检查该跟随者是否处于“暂停复制”状态
-		// 更新跟随者的已复制索引（match），若成功则继续处理
+	r.mustBeLeader()
+	rp.setActive()
+	if !m.Reject {
+		paused := rp.isPaused()
 		if rp.tryUpdate(m.LogIndex) {
-			rp.respondedTo() // 记录跟随者的最新响应时间
-			// 尝试提交日志：当多数派跟随者已复制该条目时，更新全局提交索引
+			rp.respondedTo()
 			ok, err := r.tryCommit()
 			if err != nil {
 				return nil
 			}
-			if ok { // 提交成功，广播新的复制消息（通知其他跟随者更新提交状态）
+			if ok {
 				r.broadcastReplicateMessage()
-			} else if paused { // 若跟随者之前暂停复制，则恢复发送复制消息
+			} else if paused {
 				r.sendReplicateMessage(m.From)
 			}
-
-			// according to the leadership transfer protocol listed on the p29 of the raft thesis
-			// 领导者转移逻辑（Raft 论文 p29）：若正在转移领导权，且目标跟随者已同步所有日志
+			// according to the leadership transfer protocol listed on the p29 of the
+			// raft thesis
 			if r.leaderTransfering() && m.From == r.leaderTransferTarget &&
 				r.log.lastIndex() == rp.match {
-				r.sendTimeoutNowMessage(r.leaderTransferTarget) // 请求目标节点立即发起选举
+				r.sendTimeoutNowMessage(r.leaderTransferTarget)
 			}
 		}
-	} else { // 复制被拒绝（跟随者日志不一致）
-
-		// the replication flow control code is derived from etcd raft, it resets nextIndex to match + 1. it is thus even more conservative than the raft thesis's approach of nextIndex = nextIndex - 1 mentioned on the p21 of the thesis.
-
-		// 复制流量控制代码来源于 etcd raft，它将 nextIndex 重置为 match + 1。
-		// 因此，它比 Raft 论文中第 21 页提到的 nextIndex = nextIndex - 1 的方法更加保守。
-
-		// 复制流量控制（replication flow control）：
-		// 这是 Raft 协议中用于管理领导者向跟随者复制日志时的机制，防止发送过多消息导致网络或节点过载。
-		// etcd raft 的实现：
-		// 在日志复制失败时，etcd raft 将 nextIndex 设置为 match + 1（即已确认匹配的最新日志索引 + 1），以更保守地重试日志发送。
-		// Raft 论文中的方法：
-		// 论文中建议将 nextIndex 减 1（即 nextIndex = nextIndex - 1），逐步回退以找到匹配点。
-		// 保守性对比：
-		// nextIndex = match + 1 比 nextIndex = nextIndex - 1 更加保守，因为它直接跳到已知匹配位置的下一项，而不是逐步回退，从而减少不必要的重试次数。
-
-		// 回退跟随者的下一个待复制索引（next），重试复制（类似 Raft 论文 p21 的冲突解决逻辑）
+	} else {
+		// the replication flow control code is derived from etcd raft, it resets
+		// nextIndex to match + 1. it is thus even more conservative than the raft
+		// thesis's approach of nextIndex = nextIndex - 1 mentioned on the p21 of
+		// the thesis.
 		if rp.decreaseTo(m.LogIndex, m.Hint) {
-			r.enterRetryState(rp)          // 标记跟随者为“重试状态”
-			r.sendReplicateMessage(m.From) // 重新发送复制消息
+			r.enterRetryState(rp)
+			r.sendReplicateMessage(m.From)
 		}
 	}
 	return nil
 }
 
-// 处理心跳响应（领导者视角）
-// 作用：响应跟随者对心跳消息的确认，更新跟随者状态，并触发 ReadIndex 协议的多数派确认流程。
 func (r *raft) handleLeaderHeartbeatResp(m pb.Message, rp *remote) error {
-	r.mustBeLeader() // 仅领导者可处理心跳响应
-	//跟随者状态维护：通过 rp.setActive() 更新跟随者的活跃时间，确保领导者能准确判断集群节点的健康状态（用于后续 Quorum 检查）。
-	rp.setActive()   // 标记该跟随者为“活跃”（避免被判定为不可达）
-	rp.waitToRetry() // 重置跟随者的重试计时器（避免频繁重试）
-
-	// 若跟随者的已复制索引（match）落后于领导者最新日志，触发日志复制
+	r.mustBeLeader()
+	rp.setActive()
+	rp.waitToRetry()
 	if rp.match < r.log.lastIndex() {
-		r.sendReplicateMessage(m.From) // 向该跟随者发送日志复制消息
+		r.sendReplicateMessage(m.From)
 	}
-
-	// 心跳响应中携带 ReadIndex 协议所需的领导权确认信息（Hint 非空）
-	// heartbeat response contains leadership confirmation requested as part of the ReadIndex protocol.
-	if m.Hint != 0 { //ReadIndex 协议集成：m.Hint != 0 表示该心跳响应包含读请求的确认信息，调用 handleReadIndexLeaderConfirmation 累计多数派确认，最终完成线性一致性读。
-		r.handleReadIndexLeaderConfirmation(m) // 处理读索引的多数派确认
+	// heartbeat response contains leadership confirmation requested as part of
+	// the ReadIndex protocol.
+	if m.Hint != 0 {
+		r.handleReadIndexLeaderConfirmation(m)
 	}
 	return nil
 }
 
-//处理领导权主动转移
-//作用：实现 Raft 协议的“领导权转移”（Leadership Transfer）机制，允许当前领导者主动将领导权交接给指定目标节点，用于维护、升级等场景。
-
-/*
-关键细节：
-
-	安全检查：通过多重校验（目标有效性、无并发转移、非自身节点）避免无效转移导致的集群不稳定。
-	日志同步前提：仅当目标节点已复制领导者的所有日志（rp.match == r.log.lastIndex()）时，才触发快速转移（发送 TimeoutNow 消息），确保目标节点具备成为领导者的日志基础。
-	Raft 协议依据：参考 Raft 论文 §3.10 及 Thesis §9.6，领导权转移通过主动触发目标节点选举，实现无停机交接，避免领导者故障导致的选举延迟。
-*/
 func (r *raft) handleLeaderTransfer(m pb.Message) error {
-
-	r.mustBeLeader() // 仅领导者可发起转移
-	target := m.Hint // 从消息中提取目标节点 ID
+	r.mustBeLeader()
+	target := m.Hint
 	plog.Debugf("%s called handleLeaderTransfer, target %d", r.describe(), target)
-
-	// 合法性检查：目标节点不能是无效节点、自身，或已存在正在进行的转移
 	if target == NoNode {
 		plog.Panicf("%s leader transfer target not set", r.describe())
 	}
-	if r.leaderTransfering() { // 正在进行转移，忽略新请求
+	if r.leaderTransfering() {
 		plog.Warningf("LeaderTransfer ignored, leader transfer is ongoing")
 		return nil
 	}
-	if r.replicaID == target { // 目标是自身，无效
+	if r.replicaID == target {
 		plog.Warningf("received LeaderTransfer with target pointing to itself")
 		return nil
 	}
-
-	// 检查目标节点是否为集群已知的投票成员
 	rp, ok := r.remotes[target]
 	if !ok {
 		plog.Warningf("unknown LeaderTransfer target")
 		return nil
 	}
-
-	// 初始化转移状态：设置目标节点，重置选举计时器
 	r.leaderTransferTarget = target
 	r.electionTick = 0
 	// fast path below
 	// or wait for the target node to catch up, see p29 of the raft thesis
-	// 快速转移路径：若目标节点已同步所有日志（match == 最新日志索引）
 	if rp.match == r.log.lastIndex() {
-		r.sendTimeoutNowMessage(target) // 发送立即超时消息，触发目标节点选举
+		r.sendTimeoutNowMessage(target)
 	}
 	return nil
 }
 
-// 处理读索引确认（ReadIndex 协议）
-// 作用：完成 ReadIndex 协议的最后一步——收集多数派节点对“已提交日志索引”的确认，确保客户端读取到的是集群一致的最新数据（线性一致性读）。
-/*
-关键细节：
-
-ReadIndex 协议流程：
-	领导者收到读请求后记录当前提交索引（log.committed）。
-	广播带上下文的心跳消息，要求跟随者确认已同步该索引。
-	本函数收集多数派（r.quorum()）确认后，标记该索引为“可读”（addReadyToRead），客户端即可安全读取。
-上下文传递：通过 m.Hint 和 m.HintHigh 携带客户端请求元数据，确保响应能准确关联到原始读请求。
-*/
 func (r *raft) handleReadIndexLeaderConfirmation(m pb.Message) {
-	// 从消息中提取读请求上下文（如客户端 ID、请求 ID）
 	ctx := pb.SystemCtx{
 		Low:  m.Hint,
 		High: m.HintHigh,
 	}
-	// 确认多数派节点已认可该读索引（r.quorum() 为集群多数派数量）
 	ris := r.readIndex.confirm(ctx, m.From, r.quorum())
-	// 处理每个确认结果：本地记录或向请求节点发送响应
 	for _, s := range ris {
 		if s.from == NoNode || s.from == r.replicaID {
-			// 本地节点或无来源的确认：添加到可读队列（供客户端读取）
 			r.addReadyToRead(s.index, s.ctx)
 		} else {
-			// 其他节点的确认：发送 ReadIndexResp 消息通知结果
 			r.send(pb.Message{
 				To:       s.from,
 				Type:     pb.ReadIndexResp,
-				LogIndex: s.index,    // 已确认的提交索引
-				Hint:     m.Hint,     // 原始请求上下文（低 64 位）
-				HintHigh: m.HintHigh, // 原始请求上下文（高 64 位）
+				LogIndex: s.index,
+				Hint:     m.Hint,
+				HintHigh: m.HintHigh,
 			})
 		}
 	}
 }
 
-// 处理快照同步状态
-// 作用：领导者接收跟随者对快照同步的状态响应（成功/失败），更新目标节点的同步状态，确保快照复制流程正常结束。
-
-/*
-关键细节：
-
-快照同步场景：当跟随者日志落后过多时，领导者会发送快照（而非逐条日志）进行快速同步。本函数处理跟随者对快照的反馈。
-状态流转：同步结束后（成功/失败），目标节点从 remoteSnapshot（快照中）转为 wait（等待）状态，避免重复同步。
-进度跟踪：通过 rp.setSnapshotAck 记录快照确认信息，领导者可通过 checkPendingSnapshotAck 监控所有节点的同步进度。
-*/
 func (r *raft) handleLeaderSnapshotStatus(m pb.Message, rp *remote) error {
-	// 仅处理处于“快照同步”状态的节点（避免干扰其他状态的节点）
 	if rp.state != remoteSnapshot {
 		return nil
 	}
-	// m.Hint == 0 表示快照同步结果通知（成功/失败）
 	if m.Hint == 0 {
-		if m.Reject { //快照同步失败
-			rp.clearPendingSnapshot() //清除该节点的‘待处理快照’标记
+		if m.Reject {
+			rp.clearPendingSnapshot()
 			plog.Warningf("%s snapshot failed, %s is now in wait state",
 				r.describe(), ReplicaID(m.From))
-		} else { //快照同步成功
+		} else {
 			plog.Debugf("%s snapshot succeeded, %s in wait state now, next %d",
 				r.describe(), ReplicaID(m.From), rp.next)
 		}
-		rp.becomeWait() //无论成败，节点都进入等待状态（等待下一次同步指令）
-	} else { //hint != 0 表示快照确认信息（用于领导者跟踪快照进度）
-		rp.setSnapshotAck(m.Hint, m.Reject) //记录快照确认状态（索引+是否拒绝）
-		r.snapshotting = true               //标记 集群正在进行快照同步
+		rp.becomeWait()
+	} else {
+		rp.setSnapshotAck(m.Hint, m.Reject)
+		r.snapshotting = true
 	}
 	return nil
 }
 
-// 处理节点不可达事件
-// 作用：当领导者检测到 某个跟随者节点不可达（如网络超时），将其转入‘重试状态’，触发后续的重试机制以恢复通信和日志同步。
-/*
-触发条件：通常由底层网络模块（如定期健康检查）发送 Unreachable 消息触发，指示目标节点暂时无法通信。
-重试状态：通过 enterRetryState 将节点状态从 remoteReplicate（正常复制）转为 retry（重试），领导者会调整复制策略（如降低频率、回退日志索引）以尝试恢复同步。
-*/
 func (r *raft) handleLeaderUnreachable(m pb.Message, rp *remote) error {
 	plog.Debugf("%s received Unreachable, %s entered retry state",
 		r.describe(), ReplicaID(m.From))
-	r.enterRetryState(rp) //将不可达节点转入‘重试状态’
+	r.enterRetryState(rp)
 	return nil
 }
 
-// 处理流量控制消息
-// 作用：根据跟随者反馈的流量负载状态，动态调整领导者向其发送日志/快照的速率，避免网络拥塞或节点过载。
-/*
-流量控制机制：r.rl 是速率限制器实例，通过接收跟随者发送的 RateLimit 消息（包含当前负载信息，如 m.Hint），动态调整发送窗口或间隔，避免“快领导者”压垮“慢跟随者”。
-灵活性：支持动态启用/禁用，禁用时直接丢弃流量控制消息，不影响核心复制逻辑。
-*/
 func (r *raft) handleLeaderRateLimit(m pb.Message) error {
-	if r.rl.Enabled() { // 若流量控制模块已启用
-		// 更新目标跟随者的状态（如当前负载、可接受的复制速率）
+	if r.rl.Enabled() {
 		r.rl.SetFollowerState(m.From, m.Hint)
 	} else {
 		plog.Warningf("%s dropped rate limit msg, rl disabled", r.describe())
@@ -3424,54 +3738,35 @@ func (r *raft) handleLeaderRateLimit(m pb.Message) error {
 	return nil
 }
 
-// 节点状态转为重试
-// 作用：将指定节点的状态从“正常复制”转为“重试”，是处理复制失败或节点不可达的核心状态转换函数。
-
-// 状态机设计：
-//
-//	remote 结构体维护节点的复制状态（如 replicate/snapshot/retry/wait），
-//	enterRetryState 是状态流转的“开关”，确保只有正常复制中的节点会进入重试流程。
-//
-// 重试触发场景：通常由 handleLeaderUnreachable（节点不可达）或 handleLeaderReplicateResp（复制被拒绝）调用，后续领导者会通过 sendReplicateMessage 重试日志同步。
 func (r *raft) enterRetryState(rp *remote) {
-	if rp.state == remoteReplicate { // 仅当节点当前处于“正常复制”状态时，才转为“重试”状态（避免重复转换）
-		rp.becomeRetry() // 调用 remote 方法切换状态
+	if rp.state == remoteReplicate {
+		rp.becomeRetry()
 	}
 }
 
-// 检查快照确认超时
-// 作用：领导者定期检查快照同步的确认状态，处理超时未响应的节点，确保快照复制不会无限期阻塞。
-
-// 超时处理：通过 rp.delayed.tick() 检查快照同步是否超时（如配置的 30s 内未收到确认），超时则主动构造 SnapshotStatus 消息，标记为拒绝，避免无限等待。
-// 全覆盖检查：依次检查 remotes（投票成员）、nonVotings（非投票成员）、witnesses（见证成员），确保所有类型节点的快照状态均被处理。
-// 快照状态重置：若所有节点快照均已确认或超时，r.snapshotting 会被设为 false，结束本次快照同步流程。
 func (r *raft) checkPendingSnapshotAck() error {
-	if r.isLeader() && r.snapshotting { // 仅领导者且快照同步中触发检查
-
-		// 定义检查函数：遍历节点集合，处理超时快照
+	if r.isLeader() && r.snapshotting {
 		check := func(m map[uint64]*remote) error {
 			for from, rp := range m {
-				if rp.state == remoteSnapshot { // 仅处理“快照同步中”的节点
-					if rp.delayed.tick() { // 检查快照是否超时（delayed 是延迟计时器）
-						// 主动构造“快照状态”消息，模拟节点超时响应
+				if rp.state == remoteSnapshot {
+					if rp.delayed.tick() {
 						if err := r.Handle(pb.Message{
 							Type:   pb.SnapshotStatus,
 							From:   from,
-							Reject: rp.delayed.rejected, // 标记为超时拒绝
+							Reject: rp.delayed.rejected,
 							Hint:   0,
 						}); err != nil {
 							return err
 						}
-						rp.clearSnapshotAck() // 清除该节点的待确认快照
+						rp.clearSnapshotAck()
 					} else {
-						r.snapshotting = true // 未超时，保持快照同步状态
+						r.snapshotting = true
 					}
 				}
 			}
 			return nil
 		}
-		r.snapshotting = false // 先假设所有快照已处理
-		// 依次检查投票成员、非投票成员、见证成员的快照状态
+		r.snapshotting = false
 		if err := check(r.remotes); err != nil {
 			return err
 		}
@@ -3489,62 +3784,26 @@ func (r *raft) checkPendingSnapshotAck() error {
 // message handlers used by nonVoting, re-route them to follower handlers
 //
 
-// handleNonVotingReplicate 处理非投票节点的复制消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的复制消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingReplicate(m pb.Message) error {
 	return r.handleFollowerReplicate(m)
 }
 
-// handleNonVotingHeartbeat 处理非投票节点的心跳消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的心跳消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingHeartbeat(m pb.Message) error {
 	return r.handleFollowerHeartbeat(m)
 }
 
-// handleNonVotingSnapshot 处理非投票节点的快照消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的快照消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingSnapshot(m pb.Message) error {
 	return r.handleFollowerInstallSnapshot(m)
 }
 
-// handleNonVotingPropose 处理非投票节点的提案消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的提案消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingPropose(m pb.Message) error {
 	return r.handleFollowerPropose(m)
 }
 
-// handleNonVotingReadIndex 处理非投票节点的读索引消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的读索引消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingReadIndex(m pb.Message) error {
 	return r.handleFollowerReadIndex(m)
 }
 
-// handleNonVotingReadIndexResp 处理非投票节点的读索引响应消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的读索引响应消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingReadIndexResp(m pb.Message) error {
 	return r.handleFollowerReadIndexResp(m)
 }
@@ -3553,22 +3812,228 @@ func (r *raft) handleNonVotingReadIndexResp(m pb.Message) error {
 // message handlers used by witness, re-route them to follower handlers
 //
 
-// handleWitnessReplicate 处理见证节点收到的日志复制请求
-// 见证节点仅参与法定人数计算，不存储完整日志，复用跟随者的日志复制处理逻辑
 func (r *raft) handleWitnessReplicate(m pb.Message) error {
 	return r.handleFollowerReplicate(m)
 }
 
-// handleWitnessHeartbeat 处理见证节点收到的领导者心跳消息
-// 维持与领导者的连接状态，复用跟随者的心跳处理逻辑
 func (r *raft) handleWitnessHeartbeat(m pb.Message) error {
 	return r.handleFollowerHeartbeat(m)
 }
 
-// handleWitnessSnapshot 处理见证节点收到的快照安装请求
-// 快速同步集群状态，复用跟随者的快照安装处理逻辑
 func (r *raft) handleWitnessSnapshot(m pb.Message) error {
 	return r.handleFollowerInstallSnapshot(m)
+}
+
+//
+// message handlers used by follower
+//
+
+func (r *raft) handleFollowerPropose(m pb.Message) error {
+	if r.leaderID == NoLeader {
+		plog.Warningf("%s dropped proposal, no leader", r.describe())
+		r.reportDroppedProposal(m)
+		return nil
+	}
+	m.To = r.leaderID
+	// the message might be queued by the transport layer, this violates the
+	// requirement of the entryQueue.get() func. copy the m.Entries to its
+	// own space.
+	m.Entries = newEntrySlice(m.Entries)
+	r.send(m)
+	return nil
+}
+
+func (r *raft) leaderIsAvailable() {
+	r.electionTick = 0
+}
+
+func (r *raft) handleFollowerReplicate(m pb.Message) error {
+	r.leaderIsAvailable()
+	r.setLeaderID(m.From)
+	return r.handleReplicateMessage(m)
+}
+
+func (r *raft) handleFollowerHeartbeat(m pb.Message) error {
+	r.leaderIsAvailable()
+	r.setLeaderID(m.From)
+	return r.handleHeartbeatMessage(m)
+}
+
+func (r *raft) handleFollowerReadIndex(m pb.Message) error {
+	if r.leaderID == NoLeader {
+		plog.Warningf("%s dropped ReadIndex, no leader", r.describe())
+		r.reportDroppedReadIndex(m)
+		return nil
+	}
+	m.To = r.leaderID
+	r.send(m)
+	return nil
+}
+
+func (r *raft) handleFollowerLeaderTransfer(m pb.Message) error {
+	if r.leaderID == NoLeader {
+		plog.Warningf("%s dropped LeaderTransfer, no leader", r.describe())
+		return nil
+	}
+	m.To = r.leaderID
+	r.send(m)
+	return nil
+}
+
+func (r *raft) handleFollowerReadIndexResp(m pb.Message) error {
+	ctx := pb.SystemCtx{
+		Low:  m.Hint,
+		High: m.HintHigh,
+	}
+	r.leaderIsAvailable()
+	r.setLeaderID(m.From)
+	r.addReadyToRead(m.LogIndex, ctx)
+	return nil
+}
+
+func (r *raft) handleFollowerInstallSnapshot(m pb.Message) error {
+	r.leaderIsAvailable()
+	r.setLeaderID(m.From)
+	return r.handleInstallSnapshotMessage(m)
+}
+
+func (r *raft) handleFollowerTimeoutNow(m pb.Message) error {
+	// the last paragraph, p29 of the raft thesis mentions that this is nothing
+	// different from the clock moving forward quickly
+	plog.Debugf("%s TimeoutNow received", r.describe())
+	r.electionTick = r.randomizedElectionTimeout
+	r.isLeaderTransferTarget = true
+	if err := r.tick(); err != nil {
+		return err
+	}
+	if r.isLeaderTransferTarget {
+		r.isLeaderTransferTarget = false
+	}
+	return nil
+}
+
+//
+// handler functions used by candidate
+//
+
+func (r *raft) doubleCheckTermMatched(msgTerm uint64) {
+	if msgTerm != 0 && r.term != msgTerm {
+		plog.Panicf("%s mismatched term found", r.describe())
+	}
+}
+
+func (r *raft) handleCandidatePropose(m pb.Message) error {
+	plog.Warningf("%s dropped proposal, no leader", r.describe())
+	r.reportDroppedProposal(m)
+	return nil
+}
+
+func (r *raft) handleCandidateReadIndex(m pb.Message) error {
+	plog.Warningf("%s dropped read index, no leader", r.describe())
+	r.reportDroppedReadIndex(m)
+	ctx := pb.SystemCtx{
+		Low:  m.Hint,
+		High: m.HintHigh,
+	}
+	r.droppedReadIndexes = append(r.droppedReadIndexes, ctx)
+	return nil
+}
+
+// when any of the following three methods
+// handleCandidateReplicate
+// handleCandidateInstallSnapshot
+// handleCandidateHeartbeat
+// is called, it implies that m.Term == r.term and there is a leader
+// for that term. see 4th paragraph section 5.2 of the raft paper
+func (r *raft) handleCandidateReplicate(m pb.Message) error {
+	r.becomeFollower(r.term, m.From)
+	return r.handleReplicateMessage(m)
+}
+
+func (r *raft) handleCandidateInstallSnapshot(m pb.Message) error {
+	r.becomeFollower(r.term, m.From)
+	return r.handleInstallSnapshotMessage(m)
+}
+
+func (r *raft) handleCandidateHeartbeat(m pb.Message) error {
+	r.becomeFollower(r.term, m.From)
+	return r.handleHeartbeatMessage(m)
+}
+
+func (r *raft) handleCandidateRequestVoteResp(m pb.Message) error {
+	if _, ok := r.nonVotings[m.From]; ok {
+		plog.Warningf("dropped RequestVoteResp from nonVoting")
+		return nil
+	}
+	count := r.handleVoteResp(m.From, m.Reject, false)
+	plog.Warningf("%s received %d votes and %d rejections, quorum is %d",
+		r.describe(), count, len(r.votes)-count, r.quorum())
+	// 3rd paragraph section 5.2 of the raft paper
+	if count == r.quorum() {
+		if err := r.becomeLeader(); err != nil {
+			return err
+		}
+		// get the NoOP entry committed ASAP
+		r.broadcastReplicateMessage()
+	} else if len(r.votes)-count == r.quorum() {
+		// etcd raft does this, it is not stated in the raft paper
+		r.becomeFollower(r.term, NoLeader)
+	}
+	return nil
+}
+
+//
+// handler functions for preVote candidate
+//
+
+func (r *raft) handlePreVoteCandidateRequestPreVoteResp(m pb.Message) error {
+	if _, ok := r.nonVotings[m.From]; ok {
+		plog.Warningf("dropped RequestPreVoteResp from nonVoting")
+		return nil
+	}
+	count := r.handleVoteResp(m.From, m.Reject, true)
+	plog.Warningf("%s received %d preVotes and %d rejections, quorum is %d",
+		r.describe(), count, len(r.votes)-count, r.quorum())
+	if count == r.quorum() {
+		if err := r.campaign(); err != nil {
+			return err
+		}
+	} else if len(r.votes)-count == r.quorum() {
+		// etcd raft does this, it is not stated in the raft paper
+		r.becomeFollower(r.term, NoLeader)
+	}
+	return nil
+}
+
+func (r *raft) reportDroppedConfigChange(e pb.Entry) {
+	r.droppedEntries = append(r.droppedEntries, e)
+}
+
+func (r *raft) reportDroppedProposal(m pb.Message) {
+	r.droppedEntries = append(r.droppedEntries, newEntrySlice(m.Entries)...)
+	if r.events != nil {
+		info := server.ProposalInfo{
+			ShardID:   r.shardID,
+			ReplicaID: r.replicaID,
+			Entries:   m.Entries,
+		}
+		r.events.ProposalDropped(info)
+	}
+}
+
+func (r *raft) reportDroppedReadIndex(m pb.Message) {
+	sysctx := pb.SystemCtx{
+		Low:  m.Hint,
+		High: m.HintHigh,
+	}
+	r.droppedReadIndexes = append(r.droppedReadIndexes, sysctx)
+	if r.events != nil {
+		info := server.ReadIndexInfo{
+			ShardID:   r.shardID,
+			ReplicaID: r.replicaID,
+		}
+		r.events.ReadIndexDropped(info)
+	}
 }
 
 /*
@@ -3611,6 +4076,143 @@ func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
 	return w
 }
 
+// defaultHandle 是默认消息分发函数，根据节点当前状态（state）和消息类型（Type），
+// 从 handlers 映射中查找并调用对应的处理函数。是 Raft 状态机消息处理的入口。
+// 参数：
+//   - r: raft 节点实例
+//   - m: 待处理的消息
+//
+// 返回值：
+//   - error: 处理过程中遇到的错误（无对应处理器时返回 nil）
+func defaultHandle(r *raft, m pb.Message) error {
+	// 从状态-消息类型映射中查找处理器（handlers 由 initializeHandlerMap 初始化）
+	if f := r.handlers[r.state][m.Type]; f != nil {
+		return f(m) // 调用对应状态下的消息处理器
+	}
+	return nil // 无匹配处理器，忽略消息
+}
+
+// initializeHandlerMap 初始化状态-消息类型到处理器的映射（handlers），
+// 为每个 Raft 状态（候选者/预选举候选者/跟随者/领导者/非投票成员/见证成员）注册对应的消息处理函数，
+// 确保消息按节点当前状态正确路由到专用处理器。
+func (r *raft) initializeHandlerMap() {
+	// candidate（候选者状态）：处理选举、投票响应、日志复制等消息
+	r.handlers[candidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[candidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[candidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[candidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[candidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[candidate][pb.RequestVoteResp] = r.handleCandidateRequestVoteResp
+	r.handlers[candidate][pb.Election] = r.handleNodeElection
+	r.handlers[candidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[candidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[candidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[candidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[candidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[candidate][pb.LogQuery] = r.handleLogQuery
+
+	// preVoteCandidate（预选举候选者状态）：处理预选举响应及其他与候选者共享的消息
+	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[preVoteCandidate][pb.RequestPreVoteResp] = r.handlePreVoteCandidateRequestPreVoteResp // 预选举专用响应处理器
+	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection
+	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery
+
+	// follower（跟随者状态）：处理提案转发、日志复制、心跳、快照安装等消息
+	r.handlers[follower][pb.Propose] = r.handleFollowerPropose
+	r.handlers[follower][pb.Replicate] = r.handleFollowerReplicate
+	r.handlers[follower][pb.Heartbeat] = r.handleFollowerHeartbeat
+	r.handlers[follower][pb.ReadIndex] = r.handleFollowerReadIndex
+	r.handlers[follower][pb.LeaderTransfer] = r.handleFollowerLeaderTransfer
+	r.handlers[follower][pb.ReadIndexResp] = r.handleFollowerReadIndexResp
+	r.handlers[follower][pb.InstallSnapshot] = r.handleFollowerInstallSnapshot
+	r.handlers[follower][pb.Election] = r.handleNodeElection
+	r.handlers[follower][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[follower][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[follower][pb.TimeoutNow] = r.handleFollowerTimeoutNow // 领导者转移触发超时
+	r.handlers[follower][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[follower][pb.LocalTick] = r.handleLocalTick
+	r.handlers[follower][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[follower][pb.LogQuery] = r.handleLogQuery
+
+	// leader（领导者状态）：处理提案、读索引、复制响应、心跳响应、领导者转移等核心功能
+	r.handlers[leader][pb.LeaderHeartbeat] = r.handleLeaderHeartbeat            // 广播心跳
+	r.handlers[leader][pb.CheckQuorum] = r.handleLeaderCheckQuorum              // 检查 quorum 可用性
+	r.handlers[leader][pb.Propose] = r.handleLeaderPropose                      // 处理客户端提案
+	r.handlers[leader][pb.ReadIndex] = r.handleLeaderReadIndex                  // 线性一致性读
+	r.handlers[leader][pb.ReplicateResp] = lw(r, r.handleLeaderReplicateResp)   // 复制响应（经 lw 包装）
+	r.handlers[leader][pb.HeartbeatResp] = lw(r, r.handleLeaderHeartbeatResp)   // 心跳响应（经 lw 包装）
+	r.handlers[leader][pb.SnapshotStatus] = lw(r, r.handleLeaderSnapshotStatus) // 快照状态（经 lw 包装）
+	r.handlers[leader][pb.Unreachable] = lw(r, r.handleLeaderUnreachable)       // 节点不可达（经 lw 包装）
+	r.handlers[leader][pb.LeaderTransfer] = r.handleLeaderTransfer              // 领导者转移
+	r.handlers[leader][pb.Election] = r.handleNodeElection
+	r.handlers[leader][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[leader][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[leader][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[leader][pb.LocalTick] = r.handleLocalTick
+	r.handlers[leader][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[leader][pb.RateLimit] = r.handleLeaderRateLimit // 流量控制
+	r.handlers[leader][pb.LogQuery] = r.handleLogQuery
+
+	// nonVoting（非投票成员状态）：仅参与日志复制，不参与选举，复用跟随者处理器
+	r.handlers[nonVoting][pb.Heartbeat] = r.handleNonVotingHeartbeat
+	r.handlers[nonVoting][pb.Replicate] = r.handleNonVotingReplicate
+	r.handlers[nonVoting][pb.InstallSnapshot] = r.handleNonVotingSnapshot
+	r.handlers[nonVoting][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[nonVoting][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[nonVoting][pb.Propose] = r.handleNonVotingPropose
+	r.handlers[nonVoting][pb.ReadIndex] = r.handleNonVotingReadIndex
+	r.handlers[nonVoting][pb.ReadIndexResp] = r.handleNonVotingReadIndexResp
+	r.handlers[nonVoting][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[nonVoting][pb.LocalTick] = r.handleLocalTick
+	r.handlers[nonVoting][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[nonVoting][pb.LogQuery] = r.handleLogQuery
+
+	// witness（见证成员状态）：仅参与法定人数计算，不存储完整日志，复用跟随者处理器
+	r.handlers[witness][pb.Heartbeat] = r.handleWitnessHeartbeat
+	r.handlers[witness][pb.Replicate] = r.handleWitnessReplicate
+	r.handlers[witness][pb.InstallSnapshot] = r.handleWitnessSnapshot
+	r.handlers[witness][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[witness][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[witness][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[witness][pb.LocalTick] = r.handleLocalTick
+	r.handlers[witness][pb.SnapshotReceived] = r.handleRestoreRemote
+}
+
+// lw（lookup wrapper）是消息处理包装器，用于统一解析消息发送者的节点类型（投票成员/非投票成员/见证成员），
+// 并将消息与对应节点的复制状态（*remote）传递给实际处理函数 f。解决不同类型节点（如非投票节点、见证节点）的响应处理共性问题。
+// 参数：
+//   - r: raft 节点实例，提供节点类型映射（remotes/nonVotings/witnesses）
+//   - f: 实际消息处理函数（如 handleLeaderReplicateResp），需节点复制状态完成处理
+//
+// 返回值：
+//   - handlerFunc: 包装后的处理器，自动适配发送者节点类型
+func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
+	w := func(nm pb.Message) error {
+		// 按优先级查找发送者节点类型：投票成员 > 非投票成员 > 见证成员
+		if npr, ok := r.remotes[nm.From]; ok {
+			return f(nm, npr) // 投票成员：使用 remotes 中的复制状态
+		} else if nob, ok := r.nonVotings[nm.From]; ok {
+			return f(nm, nob) // 非投票成员：使用 nonVotings 中的复制状态
+		} else if wob, ok := r.witnesses[nm.From]; ok {
+			return f(nm, wob) // 见证成员：使用 witnesses 中的复制状态
+		} else {
+			// 未知节点：记录警告并忽略（可能为已移除节点或网络异常消息）
+			plog.Warningf("%s no remote for %s", r.describe(), ReplicaID(nm.From))
+			return nil
+		}
+	}
+	return w
+}
+
 // defaultHandle 是 Raft 节点的消息分发入口，根据当前节点状态（state）和消息类型（Type），
 // 从 handlers 映射中查找并调用对应的状态专用处理器。实现消息与状态的解耦，确保不同状态下消息处理逻辑隔离。
 // 参数：
@@ -3620,7 +4222,6 @@ func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
 // 返回值：
 //   - error: 处理器返回的错误（无匹配处理器时返回 nil）
 func defaultHandle(r *raft, m pb.Message) error {
-	// 从状态-消息类型映射中查找处理器（handlers 由 initializeHandlerMap 初始化）
 	if f := r.handlers[r.state][m.Type]; f != nil {
 		return f(m) // 调用状态-类型对应的专用处理器
 	}
@@ -3631,7 +4232,6 @@ func defaultHandle(r *raft, m pb.Message) error {
 // 为每个 Raft 状态（候选者/预选举候选者/跟随者/领导者/非投票成员/见证成员）注册对应的消息处理器。
 // 核心作用：确保节点在不同状态下对各类消息的处理逻辑符合 Raft 协议规范，避免状态混淆导致的错误。
 func (r *raft) initializeHandlerMap() {
-
 	// candidate（候选者状态）：处理选举投票、日志复制请求等，核心是争取多数派投票以晋升领导者
 	r.handlers[candidate][pb.Heartbeat] = r.handleCandidateHeartbeat             // 收到领导者心跳 → 退化为跟随者
 	r.handlers[candidate][pb.Propose] = r.handleCandidatePropose                 // 收到提案 → 丢弃（仅领导者可处理）
@@ -3649,21 +4249,20 @@ func (r *raft) initializeHandlerMap() {
 
 	// preVoteCandidate（预选举候选者状态）：预选举阶段专用，避免网络分区导致的任期膨胀
 	// 复用 candidate 的大部分处理器，仅替换预投票响应处理器
-	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat                          // 收到领导者心跳 → 退化为跟随者
-	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose                              // 收到客户端提案 → 丢弃（仅领导者可处理）
-	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex                          // 收到读请求 → 丢弃（仅领导者可处理）
-	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate                          // 收到日志复制请求 → 退化为跟随者
-	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot              // 收到快照安装请求 → 退化为跟随者
+	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
 	r.handlers[preVoteCandidate][pb.RequestPreVoteResp] = r.handlePreVoteCandidateRequestPreVoteResp // 预投票响应 → 统计预投票结果
-	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection                                 // 收到选举触发消息 → 发起预选举
-	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote                           // 收到投票请求 → 按规则投票
-	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote                     // 收到预投票请求 → 按规则预投票
-	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange                    // 配置变更事件 → 应用配置变更
-	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick                                   // 本地定时任务 → 检查预选举超时
-	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote                        // 收到快照数据 → 恢复节点状态
-	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery                                     // 日志查询请求 → 返回查询结果
+	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection
+	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery
 
-	// follower（跟随者状态）：处理提案转发、日志复制、心跳、快照安装等消息
 	// follower（跟随者状态）：被动接收领导者消息，转发客户端请求，核心是维持与领导者的同步
 	r.handlers[follower][pb.Propose] = r.handleFollowerPropose                 // 收到提案 → 转发给领导者
 	r.handlers[follower][pb.Replicate] = r.handleFollowerReplicate             // 收到日志复制 → 同步日志并响应
@@ -3681,7 +4280,6 @@ func (r *raft) initializeHandlerMap() {
 	r.handlers[follower][pb.SnapshotReceived] = r.handleRestoreRemote          // 收到快照 → 恢复节点状态
 	r.handlers[follower][pb.LogQuery] = r.handleLogQuery                       // 日志查询 → 返回查询结果
 
-	// leader（领导者状态）：处理提案、读索引、复制响应、心跳响应、领导者转移等核心功能
 	// leader（领导者状态）：主动处理客户端请求、复制日志、维持领导权，核心是保证集群一致性
 	r.handlers[leader][pb.LeaderHeartbeat] = r.handleLeaderHeartbeat            // 收到心跳触发 → 广播心跳（维持领导权）
 	r.handlers[leader][pb.CheckQuorum] = r.handleLeaderCheckQuorum              // 收到检查 quorum 消息 → 验证是否仍有多数派支持
@@ -3726,17 +4324,124 @@ func (r *raft) initializeHandlerMap() {
 	r.handlers[witness][pb.SnapshotReceived] = r.handleRestoreRemote     // 收到快照 → 恢复节点状态
 }
 
+func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
+	w := func(nm pb.Message) error {
+		if npr, ok := r.remotes[nm.From]; ok {
+			return f(nm, npr)
+		} else if nob, ok := r.nonVotings[nm.From]; ok {
+			return f(nm, nob)
+		} else if wob, ok := r.witnesses[nm.From]; ok {
+			return f(nm, wob)
+		} else {
+			plog.Warningf("%s no remote for %s", r.describe(), ReplicaID(nm.From))
+			return nil
+		}
+	}
+	return w
+}
+
+func defaultHandle(r *raft, m pb.Message) error {
+	if f := r.handlers[r.state][m.Type]; f != nil {
+		return f(m)
+	}
+	return nil
+}
+
+func (r *raft) initializeHandlerMap() {
+	// candidate
+	r.handlers[candidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[candidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[candidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[candidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[candidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[candidate][pb.RequestVoteResp] = r.handleCandidateRequestVoteResp
+	r.handlers[candidate][pb.Election] = r.handleNodeElection
+	r.handlers[candidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[candidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[candidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[candidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[candidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[candidate][pb.LogQuery] = r.handleLogQuery
+	// prevote candidate
+	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[preVoteCandidate][pb.RequestPreVoteResp] = r.handlePreVoteCandidateRequestPreVoteResp
+	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection
+	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery
+	// follower
+	r.handlers[follower][pb.Propose] = r.handleFollowerPropose
+	r.handlers[follower][pb.Replicate] = r.handleFollowerReplicate
+	r.handlers[follower][pb.Heartbeat] = r.handleFollowerHeartbeat
+	r.handlers[follower][pb.ReadIndex] = r.handleFollowerReadIndex
+	r.handlers[follower][pb.LeaderTransfer] = r.handleFollowerLeaderTransfer
+	r.handlers[follower][pb.ReadIndexResp] = r.handleFollowerReadIndexResp
+	r.handlers[follower][pb.InstallSnapshot] = r.handleFollowerInstallSnapshot
+	r.handlers[follower][pb.Election] = r.handleNodeElection
+	r.handlers[follower][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[follower][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[follower][pb.TimeoutNow] = r.handleFollowerTimeoutNow
+	r.handlers[follower][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[follower][pb.LocalTick] = r.handleLocalTick
+	r.handlers[follower][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[follower][pb.LogQuery] = r.handleLogQuery
+	// leader
+	r.handlers[leader][pb.LeaderHeartbeat] = r.handleLeaderHeartbeat
+	r.handlers[leader][pb.CheckQuorum] = r.handleLeaderCheckQuorum
+	r.handlers[leader][pb.Propose] = r.handleLeaderPropose
+	r.handlers[leader][pb.ReadIndex] = r.handleLeaderReadIndex
+	r.handlers[leader][pb.ReplicateResp] = lw(r, r.handleLeaderReplicateResp)
+	r.handlers[leader][pb.HeartbeatResp] = lw(r, r.handleLeaderHeartbeatResp)
+	r.handlers[leader][pb.SnapshotStatus] = lw(r, r.handleLeaderSnapshotStatus)
+	r.handlers[leader][pb.Unreachable] = lw(r, r.handleLeaderUnreachable)
+	r.handlers[leader][pb.LeaderTransfer] = r.handleLeaderTransfer
+	r.handlers[leader][pb.Election] = r.handleNodeElection
+	r.handlers[leader][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[leader][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[leader][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[leader][pb.LocalTick] = r.handleLocalTick
+	r.handlers[leader][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[leader][pb.RateLimit] = r.handleLeaderRateLimit
+	r.handlers[leader][pb.LogQuery] = r.handleLogQuery
+	// nonVoting
+	r.handlers[nonVoting][pb.Heartbeat] = r.handleNonVotingHeartbeat
+	r.handlers[nonVoting][pb.Replicate] = r.handleNonVotingReplicate
+	r.handlers[nonVoting][pb.InstallSnapshot] = r.handleNonVotingSnapshot
+	r.handlers[nonVoting][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[nonVoting][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[nonVoting][pb.Propose] = r.handleNonVotingPropose
+	r.handlers[nonVoting][pb.ReadIndex] = r.handleNonVotingReadIndex
+	r.handlers[nonVoting][pb.ReadIndexResp] = r.handleNonVotingReadIndexResp
+	r.handlers[nonVoting][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[nonVoting][pb.LocalTick] = r.handleLocalTick
+	r.handlers[nonVoting][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[nonVoting][pb.LogQuery] = r.handleLogQuery
+	// witness
+	r.handlers[witness][pb.Heartbeat] = r.handleWitnessHeartbeat
+	r.handlers[witness][pb.Replicate] = r.handleWitnessReplicate
+	r.handlers[witness][pb.InstallSnapshot] = r.handleWitnessSnapshot
+	r.handlers[witness][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[witness][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[witness][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[witness][pb.LocalTick] = r.handleLocalTick
+	r.handlers[witness][pb.SnapshotReceived] = r.handleRestoreRemote
+}
+
 /*
-函数核心价值：
-	checkHandlerMap 是 Raft 节点启动前的「安全检查哨」，
-	通过验证「状态-消息类型」处理器的合法性，
-	确保 initializeHandlerMap 未注册违反协议约束的处理器（如领导者处理跟随者专属的 Heartbeat 消息）。
+函数核心价值：checkHandlerMap 是 Raft 节点启动前的「安全检查哨」，通过验证「状态-消息类型」处理器的合法性，确保 initializeHandlerMap 未注册违反协议约束的处理器（如领导者处理跟随者专属的 Heartbeat 消息）。
 
 检查列表设计：checks 切片枚举了所有「无效状态-消息类型组合」，其设计依据 Raft 协议对节点状态的行为约束：
-	领导者：仅处理提案、日志复制响应等主动行为，不接收其他节点的心跳/复制请求。
-	跟随者：仅被动接收领导者消息，不处理复制响应/快照状态等领导者专属逻辑。
-	特殊节点（非投票/见证成员）：因角色限制（无投票权/无完整日志），不参与选举或复杂请求处理。
 
+领导者：仅处理提案、日志复制响应等主动行为，不接收其他节点的心跳/复制请求。
+跟随者：仅被动接收领导者消息，不处理复制响应/快照状态等领导者专属逻辑。
+特殊节点（非投票/见证成员）：因角色限制（无投票权/无完整日志），不参与选举或复杂请求处理。
 防御性编程：通过 panic 终止程序而非返回错误，确保无效处理器配置在节点启动阶段被发现，避免运行时因错误消息处理导致的集群分裂或数据不一致。
 */
 
@@ -3744,7 +4449,6 @@ func (r *raft) initializeHandlerMap() {
 // 核心作用：防止无效的状态-消息处理逻辑被注册，避免 Raft 协议状态机因错误处理而出现一致性问题。
 // 验证逻辑：遍历预定义的「禁止处理器组合」列表，若发现对应状态-消息类型存在处理器，则触发 panic。
 func (r *raft) checkHandlerMap() {
-	// following states/types are not supposed to have handler filled in
 	// checks 定义了不允许存在处理器的状态-消息类型组合，这些组合违反 Raft 协议状态约束：
 	//   - 领导者不应处理跟随者专属消息（如 Heartbeat/Replicate）
 	//   - 跟随者不应处理领导者专属响应（如 ReplicateResp/HeartbeatResp）
@@ -3792,6 +4496,54 @@ func (r *raft) checkHandlerMap() {
 		f := r.handlers[tt.stateType][tt.msgType]
 		if f != nil {
 			panic("unexpected msg handler") // 发现无效处理器，触发 panic 终止程序（防御性编程）
+		}
+	}
+}
+
+func (r *raft) checkHandlerMap() {
+	// following states/types are not supposed to have handler filled in
+	checks := []struct {
+		stateType State
+		msgType   pb.MessageType
+	}{
+		{leader, pb.Heartbeat},
+		{leader, pb.Replicate},
+		{leader, pb.InstallSnapshot},
+		{leader, pb.ReadIndexResp},
+		{leader, pb.RequestPreVoteResp},
+		{follower, pb.ReplicateResp},
+		{follower, pb.HeartbeatResp},
+		{follower, pb.SnapshotStatus},
+		{follower, pb.Unreachable},
+		{follower, pb.RequestPreVoteResp},
+		{candidate, pb.ReplicateResp},
+		{candidate, pb.HeartbeatResp},
+		{candidate, pb.SnapshotStatus},
+		{candidate, pb.Unreachable},
+		{candidate, pb.RequestPreVoteResp},
+		{preVoteCandidate, pb.ReplicateResp},
+		{preVoteCandidate, pb.HeartbeatResp},
+		{preVoteCandidate, pb.SnapshotStatus},
+		{preVoteCandidate, pb.Unreachable},
+		{nonVoting, pb.Election},
+		{nonVoting, pb.RequestVoteResp},
+		{nonVoting, pb.ReplicateResp},
+		{nonVoting, pb.HeartbeatResp},
+		{nonVoting, pb.RequestPreVoteResp},
+		{witness, pb.Election},
+		{witness, pb.Propose},
+		{witness, pb.ReadIndex},
+		{witness, pb.ReadIndexResp},
+		{witness, pb.RequestVoteResp},
+		{witness, pb.ReplicateResp},
+		{witness, pb.HeartbeatResp},
+		{witness, pb.RequestPreVoteResp},
+		{witness, pb.LogQuery},
+	}
+	for _, tt := range checks {
+		f := r.handlers[tt.stateType][tt.msgType]
+		if f != nil {
+			panic("unexpected msg handler")
 		}
 	}
 }

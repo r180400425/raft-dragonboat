@@ -3132,56 +3132,34 @@ func (r *raft) addReadyToRead(index uint64, ctx pb.SystemCtx) {
 		})
 }
 
-// 处理线性一致性读请求
-// 作用：实现 Raft 论文 6.4 节定义的 ReadIndex 协议，确保领导者返回的数据是集群中已提交的最新状态（线性一致性读），避免因网络分区或日志未同步导致的“脏读”。
-/*
-ReadIndex 协议流程（非单节点集群）：
-
-	检查提交状态：通过 hasCommittedEntryAtCurrentTerm() 确保领导者在当前任期有已提交的日志（避免新当选领导者因未提交日志而返回旧数据）。
-	记录读请求：将当前已提交索引（log.committed）和请求上下文加入 readIndex 队列。
-	广播心跳确认：发送带上下文的心跳（broadcastHeartbeatMessageWithHint），要求跟随者响应以确认它们已同步到该提交索引。
-	多数派确认后响应：当收到多数派（Quorum）跟随者的心跳响应后，领导者将该提交索引标记为“可读”，客户端即可安全读取对应数据。
-特殊节点处理：
-
-	见证节点（Witness）：仅参与 Quorum 计算，不存储完整日志，因此直接丢弃读请求。
-	单节点集群：无需多数派确认，直接使用本地已提交索引响应。
-*/
 // section 6.4 of the raft thesis
 func (r *raft) handleLeaderReadIndex(m pb.Message) error {
-	r.mustBeLeader() // 仅领导者可处理读请求
+	r.mustBeLeader()
 	ctx := pb.SystemCtx{
 		High: m.HintHigh,
 		Low:  m.Hint,
-	} // 提取请求上下文（如客户端元数据）
-	// 1. 见证节点（Witness）不参与数据读取，直接丢弃请求
+	}
 	if _, wok := r.witnesses[m.From]; wok {
 		plog.Errorf("%s dropped ReadIndex, witness node %d", r.describe(), m.From)
-
-		//  2. 非单节点集群（需多数派确认）
 	} else if !r.isSingleNodeQuorum() {
-		// 检查当前任期是否有已提交的日志条目（ReadIndex 协议前置条件）
 		if !r.hasCommittedEntryAtCurrentTerm() {
 			// leader doesn't know the commit value of the shard
-			// see raft thesis section 6.4, this is the first step of the ReadIndex protocol.
+			// see raft thesis section 6.4, this is the first step of the ReadIndex
+			// protocol.
 			plog.Warningf("%s dropped ReadIndex, not ready", r.describe())
 			r.reportDroppedReadIndex(m)
 			return nil
 		}
-		// 添加读请求到队列，记录当前已提交索引（log.committed）和请求上下文
 		r.readIndex.addRequest(r.log.committed, ctx, m.From)
-		// 广播带上下文的心跳消息，要求跟随者确认已提交索引
 		r.broadcastHeartbeatMessageWithHint(ctx)
-		// 3. 单节点集群（无需多数派确认，直接读取）
 	} else {
-		// 将已提交索引加入可读队列（供客户端读取）
 		r.addReadyToRead(r.log.committed, ctx)
-		// 若请求来自非投票节点，直接发送读响应
 		_, ook := r.nonVotings[m.From]
 		if m.From != r.replicaID && ook {
 			r.send(pb.Message{
 				To:       m.From,
 				Type:     pb.ReadIndexResp,
-				LogIndex: r.log.committed, // 已提交索引（客户端需读取此索引后的数据）
+				LogIndex: r.log.committed,
 				Hint:     m.Hint,
 				HintHigh: m.HintHigh,
 				Commit:   m.Commit,
@@ -3191,232 +3169,138 @@ func (r *raft) handleLeaderReadIndex(m pb.Message) error {
 	return nil
 }
 
-// 处理日志复制响应
-// 作用：接收跟随者对日志复制消息（Replicate）的响应，更新跟随者的复制状态，尝试提交日志条目，并处理领导者转移（Leadership Transfer）逻辑。
-
-/*
-复制状态更新：
-
-rp.tryUpdate(m.LogIndex)：更新跟随者 rp 的 match 字段（已成功复制的最大日志索引），仅当响应中的 LogIndex 大于当前 match 时生效。
-r.tryCommit()：检查是否多数派跟随者已复制当前领导者的最新日志条目，若是则更新 log.committed（全局提交索引），确保所有节点最终同步到此状态。
-领导者转移触发：
-当领导者主动转移领导权给目标节点（leaderTransferTarget），且目标节点已复制所有日志（log.lastIndex() == rp.match）时，发送 TimeoutNowMessage() 触发目标节点立即发起选举，加速领导权交接。
-
-复制冲突处理:
-若跟随者因日志不一致拒绝复制（m.Reject == true），通过 rp.decreaseTo()将跟随者的next` 索引回退至其日志匹配点+1，并进入重试状态重新发送日志，确保最终一致性。
-*/
 func (r *raft) handleLeaderReplicateResp(m pb.Message, rp *remote) error {
-	r.mustBeLeader() // 仅领导者可处理复制响应
-	rp.setActive()   // 标记该跟随者状态为“活跃”（避免被判定为不可达）
-	if !m.Reject {   // 复制成功（未被跟随者拒绝）
-		paused := rp.isPaused() // 检查该跟随者是否处于“暂停复制”状态
-		// 更新跟随者的已复制索引（match），若成功则继续处理
+	r.mustBeLeader()
+	rp.setActive()
+	if !m.Reject {
+		paused := rp.isPaused()
 		if rp.tryUpdate(m.LogIndex) {
-			rp.respondedTo() // 记录跟随者的最新响应时间
-			// 尝试提交日志：当多数派跟随者已复制该条目时，更新全局提交索引
+			rp.respondedTo()
 			ok, err := r.tryCommit()
 			if err != nil {
 				return nil
 			}
-			if ok { // 提交成功，广播新的复制消息（通知其他跟随者更新提交状态）
+			if ok {
 				r.broadcastReplicateMessage()
-			} else if paused { // 若跟随者之前暂停复制，则恢复发送复制消息
+			} else if paused {
 				r.sendReplicateMessage(m.From)
 			}
-
-			// according to the leadership transfer protocol listed on the p29 of the raft thesis
-			// 领导者转移逻辑（Raft 论文 p29）：若正在转移领导权，且目标跟随者已同步所有日志
+			// according to the leadership transfer protocol listed on the p29 of the
+			// raft thesis
 			if r.leaderTransfering() && m.From == r.leaderTransferTarget &&
 				r.log.lastIndex() == rp.match {
-				r.sendTimeoutNowMessage(r.leaderTransferTarget) // 请求目标节点立即发起选举
+				r.sendTimeoutNowMessage(r.leaderTransferTarget)
 			}
 		}
-	} else { // 复制被拒绝（跟随者日志不一致）
-
-		// the replication flow control code is derived from etcd raft, it resets nextIndex to match + 1. it is thus even more conservative than the raft thesis's approach of nextIndex = nextIndex - 1 mentioned on the p21 of the thesis.
-
-		// 复制流量控制代码来源于 etcd raft，它将 nextIndex 重置为 match + 1。
-		// 因此，它比 Raft 论文中第 21 页提到的 nextIndex = nextIndex - 1 的方法更加保守。
-
-		// 复制流量控制（replication flow control）：
-		// 这是 Raft 协议中用于管理领导者向跟随者复制日志时的机制，防止发送过多消息导致网络或节点过载。
-		// etcd raft 的实现：
-		// 在日志复制失败时，etcd raft 将 nextIndex 设置为 match + 1（即已确认匹配的最新日志索引 + 1），以更保守地重试日志发送。
-		// Raft 论文中的方法：
-		// 论文中建议将 nextIndex 减 1（即 nextIndex = nextIndex - 1），逐步回退以找到匹配点。
-		// 保守性对比：
-		// nextIndex = match + 1 比 nextIndex = nextIndex - 1 更加保守，因为它直接跳到已知匹配位置的下一项，而不是逐步回退，从而减少不必要的重试次数。
-
-		// 回退跟随者的下一个待复制索引（next），重试复制（类似 Raft 论文 p21 的冲突解决逻辑）
+	} else {
+		// the replication flow control code is derived from etcd raft, it resets
+		// nextIndex to match + 1. it is thus even more conservative than the raft
+		// thesis's approach of nextIndex = nextIndex - 1 mentioned on the p21 of
+		// the thesis.
 		if rp.decreaseTo(m.LogIndex, m.Hint) {
-			r.enterRetryState(rp)          // 标记跟随者为“重试状态”
-			r.sendReplicateMessage(m.From) // 重新发送复制消息
+			r.enterRetryState(rp)
+			r.sendReplicateMessage(m.From)
 		}
 	}
 	return nil
 }
 
-// 处理心跳响应（领导者视角）
-// 作用：响应跟随者对心跳消息的确认，更新跟随者状态，并触发 ReadIndex 协议的多数派确认流程。
 func (r *raft) handleLeaderHeartbeatResp(m pb.Message, rp *remote) error {
-	r.mustBeLeader() // 仅领导者可处理心跳响应
-	//跟随者状态维护：通过 rp.setActive() 更新跟随者的活跃时间，确保领导者能准确判断集群节点的健康状态（用于后续 Quorum 检查）。
-	rp.setActive()   // 标记该跟随者为“活跃”（避免被判定为不可达）
-	rp.waitToRetry() // 重置跟随者的重试计时器（避免频繁重试）
-
-	// 若跟随者的已复制索引（match）落后于领导者最新日志，触发日志复制
+	r.mustBeLeader()
+	rp.setActive()
+	rp.waitToRetry()
 	if rp.match < r.log.lastIndex() {
-		r.sendReplicateMessage(m.From) // 向该跟随者发送日志复制消息
+		r.sendReplicateMessage(m.From)
 	}
-
-	// 心跳响应中携带 ReadIndex 协议所需的领导权确认信息（Hint 非空）
-	// heartbeat response contains leadership confirmation requested as part of the ReadIndex protocol.
-	if m.Hint != 0 { //ReadIndex 协议集成：m.Hint != 0 表示该心跳响应包含读请求的确认信息，调用 handleReadIndexLeaderConfirmation 累计多数派确认，最终完成线性一致性读。
-		r.handleReadIndexLeaderConfirmation(m) // 处理读索引的多数派确认
+	// heartbeat response contains leadership confirmation requested as part of
+	// the ReadIndex protocol.
+	if m.Hint != 0 {
+		r.handleReadIndexLeaderConfirmation(m)
 	}
 	return nil
 }
 
-//处理领导权主动转移
-//作用：实现 Raft 协议的“领导权转移”（Leadership Transfer）机制，允许当前领导者主动将领导权交接给指定目标节点，用于维护、升级等场景。
-
-/*
-关键细节：
-
-	安全检查：通过多重校验（目标有效性、无并发转移、非自身节点）避免无效转移导致的集群不稳定。
-	日志同步前提：仅当目标节点已复制领导者的所有日志（rp.match == r.log.lastIndex()）时，才触发快速转移（发送 TimeoutNow 消息），确保目标节点具备成为领导者的日志基础。
-	Raft 协议依据：参考 Raft 论文 §3.10 及 Thesis §9.6，领导权转移通过主动触发目标节点选举，实现无停机交接，避免领导者故障导致的选举延迟。
-*/
 func (r *raft) handleLeaderTransfer(m pb.Message) error {
-
-	r.mustBeLeader() // 仅领导者可发起转移
-	target := m.Hint // 从消息中提取目标节点 ID
+	r.mustBeLeader()
+	target := m.Hint
 	plog.Debugf("%s called handleLeaderTransfer, target %d", r.describe(), target)
-
-	// 合法性检查：目标节点不能是无效节点、自身，或已存在正在进行的转移
 	if target == NoNode {
 		plog.Panicf("%s leader transfer target not set", r.describe())
 	}
-	if r.leaderTransfering() { // 正在进行转移，忽略新请求
+	if r.leaderTransfering() {
 		plog.Warningf("LeaderTransfer ignored, leader transfer is ongoing")
 		return nil
 	}
-	if r.replicaID == target { // 目标是自身，无效
+	if r.replicaID == target {
 		plog.Warningf("received LeaderTransfer with target pointing to itself")
 		return nil
 	}
-
-	// 检查目标节点是否为集群已知的投票成员
 	rp, ok := r.remotes[target]
 	if !ok {
 		plog.Warningf("unknown LeaderTransfer target")
 		return nil
 	}
-
-	// 初始化转移状态：设置目标节点，重置选举计时器
 	r.leaderTransferTarget = target
 	r.electionTick = 0
 	// fast path below
 	// or wait for the target node to catch up, see p29 of the raft thesis
-	// 快速转移路径：若目标节点已同步所有日志（match == 最新日志索引）
 	if rp.match == r.log.lastIndex() {
-		r.sendTimeoutNowMessage(target) // 发送立即超时消息，触发目标节点选举
+		r.sendTimeoutNowMessage(target)
 	}
 	return nil
 }
 
-// 处理读索引确认（ReadIndex 协议）
-// 作用：完成 ReadIndex 协议的最后一步——收集多数派节点对“已提交日志索引”的确认，确保客户端读取到的是集群一致的最新数据（线性一致性读）。
-/*
-关键细节：
-
-ReadIndex 协议流程：
-	领导者收到读请求后记录当前提交索引（log.committed）。
-	广播带上下文的心跳消息，要求跟随者确认已同步该索引。
-	本函数收集多数派（r.quorum()）确认后，标记该索引为“可读”（addReadyToRead），客户端即可安全读取。
-上下文传递：通过 m.Hint 和 m.HintHigh 携带客户端请求元数据，确保响应能准确关联到原始读请求。
-*/
 func (r *raft) handleReadIndexLeaderConfirmation(m pb.Message) {
-	// 从消息中提取读请求上下文（如客户端 ID、请求 ID）
 	ctx := pb.SystemCtx{
 		Low:  m.Hint,
 		High: m.HintHigh,
 	}
-	// 确认多数派节点已认可该读索引（r.quorum() 为集群多数派数量）
 	ris := r.readIndex.confirm(ctx, m.From, r.quorum())
-	// 处理每个确认结果：本地记录或向请求节点发送响应
 	for _, s := range ris {
 		if s.from == NoNode || s.from == r.replicaID {
-			// 本地节点或无来源的确认：添加到可读队列（供客户端读取）
 			r.addReadyToRead(s.index, s.ctx)
 		} else {
-			// 其他节点的确认：发送 ReadIndexResp 消息通知结果
 			r.send(pb.Message{
 				To:       s.from,
 				Type:     pb.ReadIndexResp,
-				LogIndex: s.index,    // 已确认的提交索引
-				Hint:     m.Hint,     // 原始请求上下文（低 64 位）
-				HintHigh: m.HintHigh, // 原始请求上下文（高 64 位）
+				LogIndex: s.index,
+				Hint:     m.Hint,
+				HintHigh: m.HintHigh,
 			})
 		}
 	}
 }
 
-// 处理快照同步状态
-// 作用：领导者接收跟随者对快照同步的状态响应（成功/失败），更新目标节点的同步状态，确保快照复制流程正常结束。
-
-/*
-关键细节：
-
-快照同步场景：当跟随者日志落后过多时，领导者会发送快照（而非逐条日志）进行快速同步。本函数处理跟随者对快照的反馈。
-状态流转：同步结束后（成功/失败），目标节点从 remoteSnapshot（快照中）转为 wait（等待）状态，避免重复同步。
-进度跟踪：通过 rp.setSnapshotAck 记录快照确认信息，领导者可通过 checkPendingSnapshotAck 监控所有节点的同步进度。
-*/
 func (r *raft) handleLeaderSnapshotStatus(m pb.Message, rp *remote) error {
-	// 仅处理处于“快照同步”状态的节点（避免干扰其他状态的节点）
 	if rp.state != remoteSnapshot {
 		return nil
 	}
-	// m.Hint == 0 表示快照同步结果通知（成功/失败）
 	if m.Hint == 0 {
-		if m.Reject { //快照同步失败
-			rp.clearPendingSnapshot() //清除该节点的‘待处理快照’标记
+		if m.Reject {
+			rp.clearPendingSnapshot()
 			plog.Warningf("%s snapshot failed, %s is now in wait state",
 				r.describe(), ReplicaID(m.From))
-		} else { //快照同步成功
+		} else {
 			plog.Debugf("%s snapshot succeeded, %s in wait state now, next %d",
 				r.describe(), ReplicaID(m.From), rp.next)
 		}
-		rp.becomeWait() //无论成败，节点都进入等待状态（等待下一次同步指令）
-	} else { //hint != 0 表示快照确认信息（用于领导者跟踪快照进度）
-		rp.setSnapshotAck(m.Hint, m.Reject) //记录快照确认状态（索引+是否拒绝）
-		r.snapshotting = true               //标记 集群正在进行快照同步
+		rp.becomeWait()
+	} else {
+		rp.setSnapshotAck(m.Hint, m.Reject)
+		r.snapshotting = true
 	}
 	return nil
 }
 
-// 处理节点不可达事件
-// 作用：当领导者检测到 某个跟随者节点不可达（如网络超时），将其转入‘重试状态’，触发后续的重试机制以恢复通信和日志同步。
-/*
-触发条件：通常由底层网络模块（如定期健康检查）发送 Unreachable 消息触发，指示目标节点暂时无法通信。
-重试状态：通过 enterRetryState 将节点状态从 remoteReplicate（正常复制）转为 retry（重试），领导者会调整复制策略（如降低频率、回退日志索引）以尝试恢复同步。
-*/
 func (r *raft) handleLeaderUnreachable(m pb.Message, rp *remote) error {
 	plog.Debugf("%s received Unreachable, %s entered retry state",
 		r.describe(), ReplicaID(m.From))
-	r.enterRetryState(rp) //将不可达节点转入‘重试状态’
+	r.enterRetryState(rp)
 	return nil
 }
 
-// 处理流量控制消息
-// 作用：根据跟随者反馈的流量负载状态，动态调整领导者向其发送日志/快照的速率，避免网络拥塞或节点过载。
-/*
-流量控制机制：r.rl 是速率限制器实例，通过接收跟随者发送的 RateLimit 消息（包含当前负载信息，如 m.Hint），动态调整发送窗口或间隔，避免“快领导者”压垮“慢跟随者”。
-灵活性：支持动态启用/禁用，禁用时直接丢弃流量控制消息，不影响核心复制逻辑。
-*/
 func (r *raft) handleLeaderRateLimit(m pb.Message) error {
-	if r.rl.Enabled() { // 若流量控制模块已启用
-		// 更新目标跟随者的状态（如当前负载、可接受的复制速率）
+	if r.rl.Enabled() {
 		r.rl.SetFollowerState(m.From, m.Hint)
 	} else {
 		plog.Warningf("%s dropped rate limit msg, rl disabled", r.describe())
@@ -3424,54 +3308,35 @@ func (r *raft) handleLeaderRateLimit(m pb.Message) error {
 	return nil
 }
 
-// 节点状态转为重试
-// 作用：将指定节点的状态从“正常复制”转为“重试”，是处理复制失败或节点不可达的核心状态转换函数。
-
-// 状态机设计：
-//
-//	remote 结构体维护节点的复制状态（如 replicate/snapshot/retry/wait），
-//	enterRetryState 是状态流转的“开关”，确保只有正常复制中的节点会进入重试流程。
-//
-// 重试触发场景：通常由 handleLeaderUnreachable（节点不可达）或 handleLeaderReplicateResp（复制被拒绝）调用，后续领导者会通过 sendReplicateMessage 重试日志同步。
 func (r *raft) enterRetryState(rp *remote) {
-	if rp.state == remoteReplicate { // 仅当节点当前处于“正常复制”状态时，才转为“重试”状态（避免重复转换）
-		rp.becomeRetry() // 调用 remote 方法切换状态
+	if rp.state == remoteReplicate {
+		rp.becomeRetry()
 	}
 }
 
-// 检查快照确认超时
-// 作用：领导者定期检查快照同步的确认状态，处理超时未响应的节点，确保快照复制不会无限期阻塞。
-
-// 超时处理：通过 rp.delayed.tick() 检查快照同步是否超时（如配置的 30s 内未收到确认），超时则主动构造 SnapshotStatus 消息，标记为拒绝，避免无限等待。
-// 全覆盖检查：依次检查 remotes（投票成员）、nonVotings（非投票成员）、witnesses（见证成员），确保所有类型节点的快照状态均被处理。
-// 快照状态重置：若所有节点快照均已确认或超时，r.snapshotting 会被设为 false，结束本次快照同步流程。
 func (r *raft) checkPendingSnapshotAck() error {
-	if r.isLeader() && r.snapshotting { // 仅领导者且快照同步中触发检查
-
-		// 定义检查函数：遍历节点集合，处理超时快照
+	if r.isLeader() && r.snapshotting {
 		check := func(m map[uint64]*remote) error {
 			for from, rp := range m {
-				if rp.state == remoteSnapshot { // 仅处理“快照同步中”的节点
-					if rp.delayed.tick() { // 检查快照是否超时（delayed 是延迟计时器）
-						// 主动构造“快照状态”消息，模拟节点超时响应
+				if rp.state == remoteSnapshot {
+					if rp.delayed.tick() {
 						if err := r.Handle(pb.Message{
 							Type:   pb.SnapshotStatus,
 							From:   from,
-							Reject: rp.delayed.rejected, // 标记为超时拒绝
+							Reject: rp.delayed.rejected,
 							Hint:   0,
 						}); err != nil {
 							return err
 						}
-						rp.clearSnapshotAck() // 清除该节点的待确认快照
+						rp.clearSnapshotAck()
 					} else {
-						r.snapshotting = true // 未超时，保持快照同步状态
+						r.snapshotting = true
 					}
 				}
 			}
 			return nil
 		}
-		r.snapshotting = false // 先假设所有快照已处理
-		// 依次检查投票成员、非投票成员、见证成员的快照状态
+		r.snapshotting = false
 		if err := check(r.remotes); err != nil {
 			return err
 		}
@@ -3489,62 +3354,26 @@ func (r *raft) checkPendingSnapshotAck() error {
 // message handlers used by nonVoting, re-route them to follower handlers
 //
 
-// handleNonVotingReplicate 处理非投票节点的复制消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的复制消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingReplicate(m pb.Message) error {
 	return r.handleFollowerReplicate(m)
 }
 
-// handleNonVotingHeartbeat 处理非投票节点的心跳消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的心跳消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingHeartbeat(m pb.Message) error {
 	return r.handleFollowerHeartbeat(m)
 }
 
-// handleNonVotingSnapshot 处理非投票节点的快照消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的快照消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingSnapshot(m pb.Message) error {
 	return r.handleFollowerInstallSnapshot(m)
 }
 
-// handleNonVotingPropose 处理非投票节点的提案消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的提案消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingPropose(m pb.Message) error {
 	return r.handleFollowerPropose(m)
 }
 
-// handleNonVotingReadIndex 处理非投票节点的读索引消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的读索引消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingReadIndex(m pb.Message) error {
 	return r.handleFollowerReadIndex(m)
 }
 
-// handleNonVotingReadIndexResp 处理非投票节点的读索引响应消息，通过委托给follower处理器来处理
-// 参数:
-//   - m: 需要处理的读索引响应消息
-//
-// 返回值:
-//   - error: 处理过程中遇到的任何错误
 func (r *raft) handleNonVotingReadIndexResp(m pb.Message) error {
 	return r.handleFollowerReadIndexResp(m)
 }
@@ -3553,20 +3382,14 @@ func (r *raft) handleNonVotingReadIndexResp(m pb.Message) error {
 // message handlers used by witness, re-route them to follower handlers
 //
 
-// handleWitnessReplicate 处理见证节点收到的日志复制请求
-// 见证节点仅参与法定人数计算，不存储完整日志，复用跟随者的日志复制处理逻辑
 func (r *raft) handleWitnessReplicate(m pb.Message) error {
 	return r.handleFollowerReplicate(m)
 }
 
-// handleWitnessHeartbeat 处理见证节点收到的领导者心跳消息
-// 维持与领导者的连接状态，复用跟随者的心跳处理逻辑
 func (r *raft) handleWitnessHeartbeat(m pb.Message) error {
 	return r.handleFollowerHeartbeat(m)
 }
 
-// handleWitnessSnapshot 处理见证节点收到的快照安装请求
-// 快速同步集群状态，复用跟随者的快照安装处理逻辑
 func (r *raft) handleWitnessSnapshot(m pb.Message) error {
 	return r.handleFollowerInstallSnapshot(m)
 }
@@ -3611,6 +3434,143 @@ func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
 	return w
 }
 
+// defaultHandle 是默认消息分发函数，根据节点当前状态（state）和消息类型（Type），
+// 从 handlers 映射中查找并调用对应的处理函数。是 Raft 状态机消息处理的入口。
+// 参数：
+//   - r: raft 节点实例
+//   - m: 待处理的消息
+//
+// 返回值：
+//   - error: 处理过程中遇到的错误（无对应处理器时返回 nil）
+func defaultHandle(r *raft, m pb.Message) error {
+	// 从状态-消息类型映射中查找处理器（handlers 由 initializeHandlerMap 初始化）
+	if f := r.handlers[r.state][m.Type]; f != nil {
+		return f(m) // 调用对应状态下的消息处理器
+	}
+	return nil // 无匹配处理器，忽略消息
+}
+
+// initializeHandlerMap 初始化状态-消息类型到处理器的映射（handlers），
+// 为每个 Raft 状态（候选者/预选举候选者/跟随者/领导者/非投票成员/见证成员）注册对应的消息处理函数，
+// 确保消息按节点当前状态正确路由到专用处理器。
+func (r *raft) initializeHandlerMap() {
+	// candidate（候选者状态）：处理选举、投票响应、日志复制等消息
+	r.handlers[candidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[candidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[candidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[candidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[candidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[candidate][pb.RequestVoteResp] = r.handleCandidateRequestVoteResp
+	r.handlers[candidate][pb.Election] = r.handleNodeElection
+	r.handlers[candidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[candidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[candidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[candidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[candidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[candidate][pb.LogQuery] = r.handleLogQuery
+
+	// preVoteCandidate（预选举候选者状态）：处理预选举响应及其他与候选者共享的消息
+	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[preVoteCandidate][pb.RequestPreVoteResp] = r.handlePreVoteCandidateRequestPreVoteResp // 预选举专用响应处理器
+	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection
+	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery
+
+	// follower（跟随者状态）：处理提案转发、日志复制、心跳、快照安装等消息
+	r.handlers[follower][pb.Propose] = r.handleFollowerPropose
+	r.handlers[follower][pb.Replicate] = r.handleFollowerReplicate
+	r.handlers[follower][pb.Heartbeat] = r.handleFollowerHeartbeat
+	r.handlers[follower][pb.ReadIndex] = r.handleFollowerReadIndex
+	r.handlers[follower][pb.LeaderTransfer] = r.handleFollowerLeaderTransfer
+	r.handlers[follower][pb.ReadIndexResp] = r.handleFollowerReadIndexResp
+	r.handlers[follower][pb.InstallSnapshot] = r.handleFollowerInstallSnapshot
+	r.handlers[follower][pb.Election] = r.handleNodeElection
+	r.handlers[follower][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[follower][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[follower][pb.TimeoutNow] = r.handleFollowerTimeoutNow // 领导者转移触发超时
+	r.handlers[follower][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[follower][pb.LocalTick] = r.handleLocalTick
+	r.handlers[follower][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[follower][pb.LogQuery] = r.handleLogQuery
+
+	// leader（领导者状态）：处理提案、读索引、复制响应、心跳响应、领导者转移等核心功能
+	r.handlers[leader][pb.LeaderHeartbeat] = r.handleLeaderHeartbeat            // 广播心跳
+	r.handlers[leader][pb.CheckQuorum] = r.handleLeaderCheckQuorum              // 检查 quorum 可用性
+	r.handlers[leader][pb.Propose] = r.handleLeaderPropose                      // 处理客户端提案
+	r.handlers[leader][pb.ReadIndex] = r.handleLeaderReadIndex                  // 线性一致性读
+	r.handlers[leader][pb.ReplicateResp] = lw(r, r.handleLeaderReplicateResp)   // 复制响应（经 lw 包装）
+	r.handlers[leader][pb.HeartbeatResp] = lw(r, r.handleLeaderHeartbeatResp)   // 心跳响应（经 lw 包装）
+	r.handlers[leader][pb.SnapshotStatus] = lw(r, r.handleLeaderSnapshotStatus) // 快照状态（经 lw 包装）
+	r.handlers[leader][pb.Unreachable] = lw(r, r.handleLeaderUnreachable)       // 节点不可达（经 lw 包装）
+	r.handlers[leader][pb.LeaderTransfer] = r.handleLeaderTransfer              // 领导者转移
+	r.handlers[leader][pb.Election] = r.handleNodeElection
+	r.handlers[leader][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[leader][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[leader][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[leader][pb.LocalTick] = r.handleLocalTick
+	r.handlers[leader][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[leader][pb.RateLimit] = r.handleLeaderRateLimit // 流量控制
+	r.handlers[leader][pb.LogQuery] = r.handleLogQuery
+
+	// nonVoting（非投票成员状态）：仅参与日志复制，不参与选举，复用跟随者处理器
+	r.handlers[nonVoting][pb.Heartbeat] = r.handleNonVotingHeartbeat
+	r.handlers[nonVoting][pb.Replicate] = r.handleNonVotingReplicate
+	r.handlers[nonVoting][pb.InstallSnapshot] = r.handleNonVotingSnapshot
+	r.handlers[nonVoting][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[nonVoting][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[nonVoting][pb.Propose] = r.handleNonVotingPropose
+	r.handlers[nonVoting][pb.ReadIndex] = r.handleNonVotingReadIndex
+	r.handlers[nonVoting][pb.ReadIndexResp] = r.handleNonVotingReadIndexResp
+	r.handlers[nonVoting][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[nonVoting][pb.LocalTick] = r.handleLocalTick
+	r.handlers[nonVoting][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[nonVoting][pb.LogQuery] = r.handleLogQuery
+
+	// witness（见证成员状态）：仅参与法定人数计算，不存储完整日志，复用跟随者处理器
+	r.handlers[witness][pb.Heartbeat] = r.handleWitnessHeartbeat
+	r.handlers[witness][pb.Replicate] = r.handleWitnessReplicate
+	r.handlers[witness][pb.InstallSnapshot] = r.handleWitnessSnapshot
+	r.handlers[witness][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[witness][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[witness][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[witness][pb.LocalTick] = r.handleLocalTick
+	r.handlers[witness][pb.SnapshotReceived] = r.handleRestoreRemote
+}
+
+// lw（lookup wrapper）是消息处理包装器，用于统一解析消息发送者的节点类型（投票成员/非投票成员/见证成员），
+// 并将消息与对应节点的复制状态（*remote）传递给实际处理函数 f。解决不同类型节点（如非投票节点、见证节点）的响应处理共性问题。
+// 参数：
+//   - r: raft 节点实例，提供节点类型映射（remotes/nonVotings/witnesses）
+//   - f: 实际消息处理函数（如 handleLeaderReplicateResp），需节点复制状态完成处理
+//
+// 返回值：
+//   - handlerFunc: 包装后的处理器，自动适配发送者节点类型
+func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
+	w := func(nm pb.Message) error {
+		// 按优先级查找发送者节点类型：投票成员 > 非投票成员 > 见证成员
+		if npr, ok := r.remotes[nm.From]; ok {
+			return f(nm, npr) // 投票成员：使用 remotes 中的复制状态
+		} else if nob, ok := r.nonVotings[nm.From]; ok {
+			return f(nm, nob) // 非投票成员：使用 nonVotings 中的复制状态
+		} else if wob, ok := r.witnesses[nm.From]; ok {
+			return f(nm, wob) // 见证成员：使用 witnesses 中的复制状态
+		} else {
+			// 未知节点：记录警告并忽略（可能为已移除节点或网络异常消息）
+			plog.Warningf("%s no remote for %s", r.describe(), ReplicaID(nm.From))
+			return nil
+		}
+	}
+	return w
+}
+
 // defaultHandle 是 Raft 节点的消息分发入口，根据当前节点状态（state）和消息类型（Type），
 // 从 handlers 映射中查找并调用对应的状态专用处理器。实现消息与状态的解耦，确保不同状态下消息处理逻辑隔离。
 // 参数：
@@ -3620,7 +3580,6 @@ func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
 // 返回值：
 //   - error: 处理器返回的错误（无匹配处理器时返回 nil）
 func defaultHandle(r *raft, m pb.Message) error {
-	// 从状态-消息类型映射中查找处理器（handlers 由 initializeHandlerMap 初始化）
 	if f := r.handlers[r.state][m.Type]; f != nil {
 		return f(m) // 调用状态-类型对应的专用处理器
 	}
@@ -3631,7 +3590,6 @@ func defaultHandle(r *raft, m pb.Message) error {
 // 为每个 Raft 状态（候选者/预选举候选者/跟随者/领导者/非投票成员/见证成员）注册对应的消息处理器。
 // 核心作用：确保节点在不同状态下对各类消息的处理逻辑符合 Raft 协议规范，避免状态混淆导致的错误。
 func (r *raft) initializeHandlerMap() {
-
 	// candidate（候选者状态）：处理选举投票、日志复制请求等，核心是争取多数派投票以晋升领导者
 	r.handlers[candidate][pb.Heartbeat] = r.handleCandidateHeartbeat             // 收到领导者心跳 → 退化为跟随者
 	r.handlers[candidate][pb.Propose] = r.handleCandidatePropose                 // 收到提案 → 丢弃（仅领导者可处理）
@@ -3649,21 +3607,20 @@ func (r *raft) initializeHandlerMap() {
 
 	// preVoteCandidate（预选举候选者状态）：预选举阶段专用，避免网络分区导致的任期膨胀
 	// 复用 candidate 的大部分处理器，仅替换预投票响应处理器
-	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat                          // 收到领导者心跳 → 退化为跟随者
-	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose                              // 收到客户端提案 → 丢弃（仅领导者可处理）
-	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex                          // 收到读请求 → 丢弃（仅领导者可处理）
-	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate                          // 收到日志复制请求 → 退化为跟随者
-	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot              // 收到快照安装请求 → 退化为跟随者
+	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
 	r.handlers[preVoteCandidate][pb.RequestPreVoteResp] = r.handlePreVoteCandidateRequestPreVoteResp // 预投票响应 → 统计预投票结果
-	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection                                 // 收到选举触发消息 → 发起预选举
-	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote                           // 收到投票请求 → 按规则投票
-	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote                     // 收到预投票请求 → 按规则预投票
-	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange                    // 配置变更事件 → 应用配置变更
-	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick                                   // 本地定时任务 → 检查预选举超时
-	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote                        // 收到快照数据 → 恢复节点状态
-	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery                                     // 日志查询请求 → 返回查询结果
+	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection
+	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery
 
-	// follower（跟随者状态）：处理提案转发、日志复制、心跳、快照安装等消息
 	// follower（跟随者状态）：被动接收领导者消息，转发客户端请求，核心是维持与领导者的同步
 	r.handlers[follower][pb.Propose] = r.handleFollowerPropose                 // 收到提案 → 转发给领导者
 	r.handlers[follower][pb.Replicate] = r.handleFollowerReplicate             // 收到日志复制 → 同步日志并响应
@@ -3681,7 +3638,6 @@ func (r *raft) initializeHandlerMap() {
 	r.handlers[follower][pb.SnapshotReceived] = r.handleRestoreRemote          // 收到快照 → 恢复节点状态
 	r.handlers[follower][pb.LogQuery] = r.handleLogQuery                       // 日志查询 → 返回查询结果
 
-	// leader（领导者状态）：处理提案、读索引、复制响应、心跳响应、领导者转移等核心功能
 	// leader（领导者状态）：主动处理客户端请求、复制日志、维持领导权，核心是保证集群一致性
 	r.handlers[leader][pb.LeaderHeartbeat] = r.handleLeaderHeartbeat            // 收到心跳触发 → 广播心跳（维持领导权）
 	r.handlers[leader][pb.CheckQuorum] = r.handleLeaderCheckQuorum              // 收到检查 quorum 消息 → 验证是否仍有多数派支持
@@ -3726,17 +3682,124 @@ func (r *raft) initializeHandlerMap() {
 	r.handlers[witness][pb.SnapshotReceived] = r.handleRestoreRemote     // 收到快照 → 恢复节点状态
 }
 
+func lw(r *raft, f func(m pb.Message, rp *remote) error) handlerFunc {
+	w := func(nm pb.Message) error {
+		if npr, ok := r.remotes[nm.From]; ok {
+			return f(nm, npr)
+		} else if nob, ok := r.nonVotings[nm.From]; ok {
+			return f(nm, nob)
+		} else if wob, ok := r.witnesses[nm.From]; ok {
+			return f(nm, wob)
+		} else {
+			plog.Warningf("%s no remote for %s", r.describe(), ReplicaID(nm.From))
+			return nil
+		}
+	}
+	return w
+}
+
+func defaultHandle(r *raft, m pb.Message) error {
+	if f := r.handlers[r.state][m.Type]; f != nil {
+		return f(m)
+	}
+	return nil
+}
+
+func (r *raft) initializeHandlerMap() {
+	// candidate
+	r.handlers[candidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[candidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[candidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[candidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[candidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[candidate][pb.RequestVoteResp] = r.handleCandidateRequestVoteResp
+	r.handlers[candidate][pb.Election] = r.handleNodeElection
+	r.handlers[candidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[candidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[candidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[candidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[candidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[candidate][pb.LogQuery] = r.handleLogQuery
+	// prevote candidate
+	r.handlers[preVoteCandidate][pb.Heartbeat] = r.handleCandidateHeartbeat
+	r.handlers[preVoteCandidate][pb.Propose] = r.handleCandidatePropose
+	r.handlers[preVoteCandidate][pb.ReadIndex] = r.handleCandidateReadIndex
+	r.handlers[preVoteCandidate][pb.Replicate] = r.handleCandidateReplicate
+	r.handlers[preVoteCandidate][pb.InstallSnapshot] = r.handleCandidateInstallSnapshot
+	r.handlers[preVoteCandidate][pb.RequestPreVoteResp] = r.handlePreVoteCandidateRequestPreVoteResp
+	r.handlers[preVoteCandidate][pb.Election] = r.handleNodeElection
+	r.handlers[preVoteCandidate][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[preVoteCandidate][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[preVoteCandidate][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[preVoteCandidate][pb.LocalTick] = r.handleLocalTick
+	r.handlers[preVoteCandidate][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[preVoteCandidate][pb.LogQuery] = r.handleLogQuery
+	// follower
+	r.handlers[follower][pb.Propose] = r.handleFollowerPropose
+	r.handlers[follower][pb.Replicate] = r.handleFollowerReplicate
+	r.handlers[follower][pb.Heartbeat] = r.handleFollowerHeartbeat
+	r.handlers[follower][pb.ReadIndex] = r.handleFollowerReadIndex
+	r.handlers[follower][pb.LeaderTransfer] = r.handleFollowerLeaderTransfer
+	r.handlers[follower][pb.ReadIndexResp] = r.handleFollowerReadIndexResp
+	r.handlers[follower][pb.InstallSnapshot] = r.handleFollowerInstallSnapshot
+	r.handlers[follower][pb.Election] = r.handleNodeElection
+	r.handlers[follower][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[follower][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[follower][pb.TimeoutNow] = r.handleFollowerTimeoutNow
+	r.handlers[follower][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[follower][pb.LocalTick] = r.handleLocalTick
+	r.handlers[follower][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[follower][pb.LogQuery] = r.handleLogQuery
+	// leader
+	r.handlers[leader][pb.LeaderHeartbeat] = r.handleLeaderHeartbeat
+	r.handlers[leader][pb.CheckQuorum] = r.handleLeaderCheckQuorum
+	r.handlers[leader][pb.Propose] = r.handleLeaderPropose
+	r.handlers[leader][pb.ReadIndex] = r.handleLeaderReadIndex
+	r.handlers[leader][pb.ReplicateResp] = lw(r, r.handleLeaderReplicateResp)
+	r.handlers[leader][pb.HeartbeatResp] = lw(r, r.handleLeaderHeartbeatResp)
+	r.handlers[leader][pb.SnapshotStatus] = lw(r, r.handleLeaderSnapshotStatus)
+	r.handlers[leader][pb.Unreachable] = lw(r, r.handleLeaderUnreachable)
+	r.handlers[leader][pb.LeaderTransfer] = r.handleLeaderTransfer
+	r.handlers[leader][pb.Election] = r.handleNodeElection
+	r.handlers[leader][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[leader][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[leader][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[leader][pb.LocalTick] = r.handleLocalTick
+	r.handlers[leader][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[leader][pb.RateLimit] = r.handleLeaderRateLimit
+	r.handlers[leader][pb.LogQuery] = r.handleLogQuery
+	// nonVoting
+	r.handlers[nonVoting][pb.Heartbeat] = r.handleNonVotingHeartbeat
+	r.handlers[nonVoting][pb.Replicate] = r.handleNonVotingReplicate
+	r.handlers[nonVoting][pb.InstallSnapshot] = r.handleNonVotingSnapshot
+	r.handlers[nonVoting][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[nonVoting][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[nonVoting][pb.Propose] = r.handleNonVotingPropose
+	r.handlers[nonVoting][pb.ReadIndex] = r.handleNonVotingReadIndex
+	r.handlers[nonVoting][pb.ReadIndexResp] = r.handleNonVotingReadIndexResp
+	r.handlers[nonVoting][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[nonVoting][pb.LocalTick] = r.handleLocalTick
+	r.handlers[nonVoting][pb.SnapshotReceived] = r.handleRestoreRemote
+	r.handlers[nonVoting][pb.LogQuery] = r.handleLogQuery
+	// witness
+	r.handlers[witness][pb.Heartbeat] = r.handleWitnessHeartbeat
+	r.handlers[witness][pb.Replicate] = r.handleWitnessReplicate
+	r.handlers[witness][pb.InstallSnapshot] = r.handleWitnessSnapshot
+	r.handlers[witness][pb.RequestVote] = r.handleNodeRequestVote
+	r.handlers[witness][pb.RequestPreVote] = r.handleNodeRequestPreVote
+	r.handlers[witness][pb.ConfigChangeEvent] = r.handleNodeConfigChange
+	r.handlers[witness][pb.LocalTick] = r.handleLocalTick
+	r.handlers[witness][pb.SnapshotReceived] = r.handleRestoreRemote
+}
+
 /*
-函数核心价值：
-	checkHandlerMap 是 Raft 节点启动前的「安全检查哨」，
-	通过验证「状态-消息类型」处理器的合法性，
-	确保 initializeHandlerMap 未注册违反协议约束的处理器（如领导者处理跟随者专属的 Heartbeat 消息）。
+函数核心价值：checkHandlerMap 是 Raft 节点启动前的「安全检查哨」，通过验证「状态-消息类型」处理器的合法性，确保 initializeHandlerMap 未注册违反协议约束的处理器（如领导者处理跟随者专属的 Heartbeat 消息）。
 
 检查列表设计：checks 切片枚举了所有「无效状态-消息类型组合」，其设计依据 Raft 协议对节点状态的行为约束：
-	领导者：仅处理提案、日志复制响应等主动行为，不接收其他节点的心跳/复制请求。
-	跟随者：仅被动接收领导者消息，不处理复制响应/快照状态等领导者专属逻辑。
-	特殊节点（非投票/见证成员）：因角色限制（无投票权/无完整日志），不参与选举或复杂请求处理。
 
+领导者：仅处理提案、日志复制响应等主动行为，不接收其他节点的心跳/复制请求。
+跟随者：仅被动接收领导者消息，不处理复制响应/快照状态等领导者专属逻辑。
+特殊节点（非投票/见证成员）：因角色限制（无投票权/无完整日志），不参与选举或复杂请求处理。
 防御性编程：通过 panic 终止程序而非返回错误，确保无效处理器配置在节点启动阶段被发现，避免运行时因错误消息处理导致的集群分裂或数据不一致。
 */
 
@@ -3744,7 +3807,6 @@ func (r *raft) initializeHandlerMap() {
 // 核心作用：防止无效的状态-消息处理逻辑被注册，避免 Raft 协议状态机因错误处理而出现一致性问题。
 // 验证逻辑：遍历预定义的「禁止处理器组合」列表，若发现对应状态-消息类型存在处理器，则触发 panic。
 func (r *raft) checkHandlerMap() {
-	// following states/types are not supposed to have handler filled in
 	// checks 定义了不允许存在处理器的状态-消息类型组合，这些组合违反 Raft 协议状态约束：
 	//   - 领导者不应处理跟随者专属消息（如 Heartbeat/Replicate）
 	//   - 跟随者不应处理领导者专属响应（如 ReplicateResp/HeartbeatResp）
@@ -3792,6 +3854,54 @@ func (r *raft) checkHandlerMap() {
 		f := r.handlers[tt.stateType][tt.msgType]
 		if f != nil {
 			panic("unexpected msg handler") // 发现无效处理器，触发 panic 终止程序（防御性编程）
+		}
+	}
+}
+
+func (r *raft) checkHandlerMap() {
+	// following states/types are not supposed to have handler filled in
+	checks := []struct {
+		stateType State
+		msgType   pb.MessageType
+	}{
+		{leader, pb.Heartbeat},
+		{leader, pb.Replicate},
+		{leader, pb.InstallSnapshot},
+		{leader, pb.ReadIndexResp},
+		{leader, pb.RequestPreVoteResp},
+		{follower, pb.ReplicateResp},
+		{follower, pb.HeartbeatResp},
+		{follower, pb.SnapshotStatus},
+		{follower, pb.Unreachable},
+		{follower, pb.RequestPreVoteResp},
+		{candidate, pb.ReplicateResp},
+		{candidate, pb.HeartbeatResp},
+		{candidate, pb.SnapshotStatus},
+		{candidate, pb.Unreachable},
+		{candidate, pb.RequestPreVoteResp},
+		{preVoteCandidate, pb.ReplicateResp},
+		{preVoteCandidate, pb.HeartbeatResp},
+		{preVoteCandidate, pb.SnapshotStatus},
+		{preVoteCandidate, pb.Unreachable},
+		{nonVoting, pb.Election},
+		{nonVoting, pb.RequestVoteResp},
+		{nonVoting, pb.ReplicateResp},
+		{nonVoting, pb.HeartbeatResp},
+		{nonVoting, pb.RequestPreVoteResp},
+		{witness, pb.Election},
+		{witness, pb.Propose},
+		{witness, pb.ReadIndex},
+		{witness, pb.ReadIndexResp},
+		{witness, pb.RequestVoteResp},
+		{witness, pb.ReplicateResp},
+		{witness, pb.HeartbeatResp},
+		{witness, pb.RequestPreVoteResp},
+		{witness, pb.LogQuery},
+	}
+	for _, tt := range checks {
+		f := r.handlers[tt.stateType][tt.msgType]
+		if f != nil {
+			panic("unexpected msg handler")
 		}
 	}
 }

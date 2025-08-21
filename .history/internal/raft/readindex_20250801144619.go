@@ -102,62 +102,42 @@ func (r *readIndex) peepCtx() raftpb.SystemCtx {
 //
 // 返回值：已完成的请求状态列表（按 FIFO 顺序，包含所有早于或等于 ctx 的请求）
 func (r *readIndex) confirm(ctx raftpb.SystemCtx, from uint64, quorum int) []*readStatus {
-
 	// 1. 查找该请求的状态
 	p, ok := r.pending[ctx]
 	if !ok {
 		return nil
 	}
-
-	// 2. 记录该节点的已确认状态
-	p.confirmed[from] = struct{}{} //空结构体
-
-	// 3. 检查是否达到法定人数：确认数（含领导者自身） >= quorum
-	// 注：+1 是因为领导者默认已确认自己仍是领导者（无需显式给自己发确认）
+	p.confirmed[from] = struct{}{}
 	if len(p.confirmed)+1 < quorum {
-		return nil //未达法定人数，继续等待
+		return nil
 	}
-
-	// 4. 收集所有早于或等于当前请求的待处理请求（FIFO 顺序，批量处理）
-	done := 0             //初始化 已处理的请求数
-	cs := []*readStatus{} //初始化 已处理的请求列表
+	done := 0
+	cs := []*readStatus{}
 	for _, pctx := range r.queue {
 		done++
-		s, ok := r.pending[pctx] //获取请求状态
+		s, ok := r.pending[pctx]
 		if !ok {
 			panic("inconsistent pending and queue content")
 		}
 		cs = append(cs, s)
-
-		// 5. 一直处理到当前传入的请求（ctx），停止遍历（所有更早请求均已收集）
 		if pctx == ctx {
-			// 6. 确保所有已完成请求的 index 不超过当前请求的 index（因请求按索引递增顺序添加）
-
-			for _, v := range cs { //遍历已处理的请求
+			for _, v := range cs {
 				if v.index > s.index {
 					panic("v.index > s.index is unexpected")
 				}
 				// re-write the index for extra safety.
 				// we don't know what we don't know.
-				// 安全起见，将所有已完成请求的 index 统一更新为当前请求的 index（最新已提交索引）
-
 				v.index = s.index
 			}
-
-			// 7. 从队列中移除已完成的请求（更新队列，保留未处理请求）
-			r.queue = r.queue[done:] // ：是切片操作，把之后的的元素移除掉
-
-			// 8. 从 pending 映射中移除已完成请求（释放资源）
+			r.queue = r.queue[done:]
 			for _, v := range cs {
 				delete(r.pending, v.ctx)
 			}
 			if len(r.queue) != len(r.pending) {
 				panic("inconsistent length")
 			}
-			return cs // 返回所有已完成请求的状态列表（供上层模块执行读操作）
+			return cs
 		}
 	}
-
-	// 若未找到 ctx（理论上不可能，因 ctx 来自 pending 映射），返回 nil
 	return nil
 }
