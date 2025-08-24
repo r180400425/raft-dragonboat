@@ -259,6 +259,15 @@ type Config struct {
 
 	// WaitReady 是否在 StartReplica 时等待节点从"恢复中"状态转为"就绪"状态后再返回。
 	WaitReady bool
+
+	// 新增链条配置参数
+	// ChainLeaderCount   uint64 // 链中领导者数量
+	// ChainFollowerCount uint64 // 每个领导者的跟随者数量
+	// LeaderChainConfig 领导者链条配置
+	LeaderChainConfig struct {
+		LeaderCount   uint64 // 链条中领导者数量
+		FollowerCount uint64 // 每个领导者的跟随者数量
+	}
 }
 
 // Validate validates the Config instance and return an error when any member
@@ -660,6 +669,15 @@ func (c *NodeHostConfig) Validate() error {
 			return err
 		}
 	}
+
+	// 新增验证链条配置参数
+	if c.Expert.ChainLeaderCount == 0 {
+		return errors.New("Expert.ChainLeaderCount must be greater than 0")
+	}
+	if c.Expert.ChainFollowerCount == 0 {
+		return errors.New("Expert.ChainFollowerCount must be greater than 0")
+	}
+
 	return nil
 }
 
@@ -993,6 +1011,9 @@ func GetDefaultExpertConfig() ExpertConfig {
 	return ExpertConfig{
 		Engine: GetDefaultEngineConfig(),
 		LogDB:  getDefaultLogDBConfig(),
+		// 添加默认链条配置
+		ChainLeaderCount:   3, // 默认3个领导者
+		ChainFollowerCount: 3, // 默认每个领导者3个跟随者
 	}
 }
 
@@ -1023,6 +1044,9 @@ type ExpertConfig struct {
 	// NodeRegistryFactory defines a custom node registry function that can be used
 	// instead of a static registry or the built in memberlist gossip mechanism.
 	NodeRegistryFactory NodeRegistryFactory
+	// 链条配置参数
+	ChainLeaderCount   uint64 // 链中领导者数量
+	ChainFollowerCount uint64 // 每个领导者的跟随者数量
 }
 
 // GossipConfig contains configurations for the gossip service. Gossip service

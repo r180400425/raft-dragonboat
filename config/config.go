@@ -42,61 +42,74 @@ import (
 ) //pb：自定义的包别名（alias），后续代码中可用 pb 代替原包名引用该包的类型、函数等。
 
 var (
+	// plog 是config包专用的日志实例，用于记录配置相关的日志信息
 	plog = logger.GetLogger("config")
 )
 
 const (
 	// don't change these, see the comments on ExpertConfig.
-	defaultExecShards  uint64 = 16
+
+	// defaultExecShards 是执行引擎第一阶段的默认分片数量，不可修改（详见ExpertConfig注释）
+	defaultExecShards uint64 = 16
+	// defaultLogDBShards 是LogDB存储引擎的默认分片数量，不可修改（详见ExpertConfig注释）
 	defaultLogDBShards uint64 = 16
 )
 
-// CompressionType is the type of the compression.
+// CompressionType is the type of the compression.数据压缩算法的类型
 type CompressionType = pb.CompressionType
 
 const (
-	// NoCompression is the CompressionType value used to indicate not to use
-	// any compression.
+	// NoCompression is the CompressionType value used to indicate not to use any compression.
+	// 不使用任何压缩算法
 	NoCompression CompressionType = pb.NoCompression
 	// Snappy is the CompressionType value used to indicate that google snappy
 	// is used for data compression.
+	// 使用Google Snappy压缩算法
 	Snappy CompressionType = pb.Snappy
 )
 
 // Config is used to configure Raft nodes.
+// Config 用于配置单个 Raft 节点的核心参数，控制 Raft 协议行为、快照策略、成员变更等关键特性。
 type Config struct {
 	// ReplicaID is a non-zero value used to identify a node within a Raft shard.
+	// 唯一标识组内的每个节点
 	ReplicaID uint64
 	// ShardID is the unique value used to identify a Raft group that contains
 	// multiple replicas.
+	// 唯一标识每个Raft组
 	ShardID uint64
 	// CheckQuorum specifies whether the leader node should periodically check
 	// non-leader node status and step down to become a follower node when it no
 	// longer has the quorum.
+	// 是否定期检查非领导者节点状态，当 Leader 失去多数副本响应时，会主动降级为 Follower，而非等待其他节点超时后发起新的选举。
 	CheckQuorum bool
-	// Whether to use PreVote for this node. PreVote is described in the section
-	// 9.7 of the raft thesis.
+	// Whether to use PreVote for this node. PreVote is described in the section 9.7 of the raft thesis.
 	PreVote bool
-	// ElectionRTT is the minimum number of message RTT between elections. Message
-	// RTT is defined by NodeHostConfig.RTTMillisecond. The Raft paper suggests it
-	// to be a magnitude greater than HeartbeatRTT, which is the interval between
+
+	// ElectionRTT is the minimum number of message RTT between elections. Message RTT is defined by NodeHostConfig.RTTMillisecond. The Raft paper suggests it to be a magnitude greater than HeartbeatRTT, which is the interval between
 	// two heartbeats. In Raft, the actual interval between elections is
 	// randomized to be between ElectionRTT and 2 * ElectionRTT.
 	//
 	// As an example, assuming NodeHostConfig.RTTMillisecond is 100 millisecond,
-	// to set the election interval to be 1 second, then ElectionRTT should be set
-	// to 10.
+	// to set the election interval to be 1 second, then ElectionRTT should be set to 10.
 	//
-	// When CheckQuorum is enabled, ElectionRTT also defines the interval for
-	// checking leader quorum.
+	// When CheckQuorum is enabled, ElectionRTT also defines the interval for checking leader quorum.
+
+	// ElectionRTT 是选举间隔的最小消息 RTT 数（RTT 由 NodeHostConfig.RTTMillisecond 定义）。
+	// Raft 协议建议该值应比 HeartbeatRTT 大一个数量级。实际选举间隔会随机在 [ElectionRTT, 2*ElectionRTT] 之间。
+	// 示例：若 RTTMillisecond=100ms，要设置选举间隔为 1s，则 ElectionRTT=10（10*100ms=1s）。
+	// 启用 CheckQuorum 时，该值同时定义 Leader 检查 quorum 的间隔。
 	ElectionRTT uint64
-	// HeartbeatRTT is the number of message RTT between heartbeats. Message
-	// RTT is defined by NodeHostConfig.RTTMillisecond. The Raft paper suggest the
-	// heartbeat interval to be close to the average RTT between nodes.
+
+	// HeartbeatRTT is the number of message RTT between heartbeats. Message RTT is defined by NodeHostConfig.RTTMillisecond. The Raft paper suggest the heartbeat interval to be close to the average RTT between nodes.
 	//
 	// As an example, assuming NodeHostConfig.RTTMillisecond is 100 millisecond,
 	// to set the heartbeat interval to be every 200 milliseconds, then
 	// HeartbeatRTT should be set to 2.
+
+	// HeartbeatRTT 是心跳间隔的消息 RTT 数（RTT 由 NodeHostConfig.RTTMillisecond 定义）。
+	// Raft 协议建议心跳间隔应接近节点间平均 RTT。示例：若 RTTMillisecond=100ms，要设置心跳间隔为 200ms，则 HeartbeatRTT=2。
+
 	HeartbeatRTT uint64
 	// SnapshotEntries defines how often the state machine should be snapshotted
 	// automatically. It is defined in terms of the number of applied Raft log
@@ -118,7 +131,18 @@ type Config struct {
 	// Once automatic snapshotting is disabled by setting the SnapshotEntries
 	// field to 0, users can still use NodeHost's RequestSnapshot or
 	// SyncRequestSnapshot methods to manually request snapshots.
+
+	// SnapshotEntries 定义状态机自动生成快照的频率（按已应用的 Raft 日志条目数计）。
+	// 设为 0 可禁用自动快照，此时需通过 NodeHost.RequestSnapshot 或 NodeHost.SyncRequestSnapshot 手动触发。
+	// 当设为 N 时，表示每应用 N 条日志后生成一次快照。生成快照后，被覆盖的日志可通过压缩释放磁盘空间（见 CompactionOverhead）。
+
+	// 一旦生成快照，被新快照覆盖的 Raft 日志条目就可以被压缩。
+	// 这包括两个步骤：首先将冗余的日志条目标记为删除，
+	// 然后在稍后的 LogDB 压缩操作中从底层存储中物理删除。
+	// 有关生成快照后实际删除和压缩哪些日志条目的详细信息，
+	// 请参见 CompactionOverhead 的 godoc。
 	SnapshotEntries uint64
+
 	// CompactionOverhead defines the number of most recent entries to keep after
 	// each Raft log compaction. Raft log compaction is performed automatically
 	// every time a snapshot is created.
@@ -134,7 +158,12 @@ type Config struct {
 	// Raft log entries between index (9,500, 10,000] to other peers and only fall
 	// back to stream the full snapshot if any Raft log entry with index <= 9,500
 	// is required to be replicated.
+
+	// CompactionOverhead 定义快照生成后保留的最近日志条目数（用于避免频繁全量快照传输）。
+	// 示例：若快照在 index=10000 生成，CompactionOverhead=500，则仅压缩 index<=9500 的日志，保留 (9500, 10000] 的条目。
+	// 这样当副本落后较少时，可直接同步保留的日志而非全量快照，减少网络开销。
 	CompactionOverhead uint64
+
 	// OrderedConfigChange determines whether Raft membership change is enforced
 	// with ordered config change ID.
 	//
@@ -145,7 +174,12 @@ type Config struct {
 	// When set to false (default), ConfigChangeIndex is ignored for membership
 	// change requests. This may cause a client to request a membership change
 	// based on stale membership data.
+
+	// OrderedConfigChange 是否启用有序配置变更 ID。启用后（推荐），成员变更请求需提供 ConfigChangeIndex，
+	// 类似乐观锁机制，确保基于最新成员信息执行变更，避免 stale 数据导致的错误。默认关闭（忽略 ConfigChangeIndex）。
+
 	OrderedConfigChange bool
+
 	// MaxInMemLogSize is the target size in bytes allowed for storing in memory
 	// Raft logs on each Raft node. In memory Raft logs are the ones that have
 	// not been applied yet.
@@ -156,14 +190,24 @@ type Config struct {
 	// when clients try to make new proposals.
 	// MaxInMemLogSize is recommended to be significantly larger than the biggest
 	// proposal you are going to use.
+
+	// MaxInMemLogSize 单节点允许的内存中未应用 Raft 日志目标大小（字节）。用于防止内存无限制增长。
+	// 设为 0 表示无限制（math.MaxUint64）；达到阈值后，新提议将返回错误。建议值远大于最大提议大小。
+
 	MaxInMemLogSize uint64
 	// SnapshotCompressionType is the compression type to use for compressing
 	// generated snapshot data. No compression is used by default.
+
+	// SnapshotCompressionType 快照数据的压缩算法，默认不压缩（NoCompression）。
+
 	SnapshotCompressionType CompressionType
 	// EntryCompressionType is the compression type to use for compressing the
 	// payload of user proposals. When Snappy is used, the maximum proposal
 	// payload allowed is roughly limited to 3.42GBytes. No compression is used
 	// by default.
+
+	// EntryCompressionType 用户提议 payload 的压缩算法，默认不压缩（NoCompression）。
+	// 使用 Snappy 时，最大提议 payload 约为 3.42GB。
 	EntryCompressionType CompressionType
 	// DisableAutoCompactions disables auto compaction used for reclaiming Raft
 	// log entry storage spaces. By default, compaction request is issued every
@@ -171,33 +215,59 @@ type Config struct {
 	// soon as possible at the cost of immediate higher IO overhead. Users can
 	// disable such auto compactions and use NodeHost.RequestCompaction to
 	// manually request such compactions when necessary.
+
+	// DisableAutoCompactions 是否禁用快照生成后的自动日志压缩。默认启用（快照后立即压缩日志释放空间），
+	// 禁用后需通过 NodeHost.RequestCompaction 手动触发，适合需要控制 IO 峰值的场景
+
 	DisableAutoCompactions bool
 	// IsNonVoting indicates whether this is a non-voting Raft node. Described as
 	// non-voting members in the section 4.2.1 of Diego Ongaro's thesis, they are
 	// used to allow a new node to join the shard and catch up with other
 	// existing ndoes without impacting the availability. Extra non-voting nodes
 	// can also be introduced to serve read-only requests.
+
+	// IsNonVoting 是否为非投票节点（Non-Voting Member，Raft 论文 4.2.1 节）。不参与 Leader 选举和提议投票，
+	// 仅同步日志并执行状态机，用于新节点加入时"追赶数据"或作为只读副本分担查询压力。
 	IsNonVoting bool
 	// IsObserver indicates whether this is a non-voting Raft node without voting
 	// power.
 	//
 	// Deprecated: use IsNonVoting instead.
+
+	// IsObserver （已废弃，使用 IsNonVoting 替代）标识无投票权的非投票节点。
 	IsObserver bool
 	// IsWitness indicates whether this is a witness Raft node without actual log
 	// replication and do not have state machine. It is mentioned in the section
 	// 11.7.2 of Diego Ongaro's thesis.
 	//
 	// Witness support is currently experimental.
+
+	// IsWitness 是否为 Witness 节点（Raft 论文 11.7.2 节）。不存储完整日志和状态机，仅参与 quorum 计数，
+	// 用于跨地域部署时降低带宽开销。当前为实验性功能。.
 	IsWitness bool
 	// Quiesce specifies whether to let the Raft shard enter quiesce mode when
 	// there is no shard activity. Shards in quiesce mode do not exchange
 	// heartbeat messages to minimize bandwidth consumption.
 	//
 	// Quiesce support is currently experimental.
+
+	// Quiesce 是否启用"静默模式"。当 Raft 组无活动时，节点停止发送心跳以减少带宽消耗。当前为实验性功能。
+
 	Quiesce bool
 	// WaitReady specifies whether to wait for the node to transition
 	// from recovering to ready state before returning from StartReplica.
+
+	// WaitReady 是否在 StartReplica 时等待节点从"恢复中"状态转为"就绪"状态后再返回。
 	WaitReady bool
+
+	// 新增链条配置参数
+	// ChainLeaderCount   uint64 // 链中领导者数量
+	// ChainFollowerCount uint64 // 每个领导者的跟随者数量
+	// LeaderChainConfig 领导者链条配置
+	LeaderChainConfig struct {
+		LeaderCount   uint64 // 链条中领导者数量
+		FollowerCount uint64 // 每个领导者的跟随者数量
+	}
 }
 
 // Validate validates the Config instance and return an error when any member
@@ -599,6 +669,15 @@ func (c *NodeHostConfig) Validate() error {
 			return err
 		}
 	}
+
+	// 新增验证链条配置参数
+	if c.Expert.ChainLeaderCount == 0 {
+		return errors.New("Expert.ChainLeaderCount must be greater than 0")
+	}
+	if c.Expert.ChainFollowerCount == 0 {
+		return errors.New("Expert.ChainFollowerCount must be greater than 0")
+	}
+
 	return nil
 }
 
@@ -932,6 +1011,9 @@ func GetDefaultExpertConfig() ExpertConfig {
 	return ExpertConfig{
 		Engine: GetDefaultEngineConfig(),
 		LogDB:  getDefaultLogDBConfig(),
+		// 添加默认链条配置
+		ChainLeaderCount:   3, // 默认3个领导者
+		ChainFollowerCount: 3, // 默认每个领导者3个跟随者
 	}
 }
 
@@ -962,6 +1044,9 @@ type ExpertConfig struct {
 	// NodeRegistryFactory defines a custom node registry function that can be used
 	// instead of a static registry or the built in memberlist gossip mechanism.
 	NodeRegistryFactory NodeRegistryFactory
+	// 链条配置参数
+	ChainLeaderCount   uint64 // 链中领导者数量
+	ChainFollowerCount uint64 // 每个领导者的跟随者数量
 }
 
 // GossipConfig contains configurations for the gossip service. Gossip service
