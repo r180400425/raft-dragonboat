@@ -1,0 +1,40 @@
+syntax = "proto3";
+package raftpb;
+
+
+// protoc --gogo_out=. raftpb/chainconfig.proto
+
+// ChainConfig 链式复制配置参数（分片级）
+message ChainConfig {
+  bool enable_chain = 1;                // 是否启用链式复制
+  uint64 default_next_shard_id = 2;     // 默认下游分片ID
+  uint64 fallback_next_shard_id = 10;   // 备用下游分片ID（故障切换）
+  uint64 default_prev_shard_id = 11;    // 上游分片ID（双向链）
+  
+  // 健康检查与重试
+  uint64 health_check_interval_ms = 3;  // 健康检查间隔（毫秒）
+  int32 max_retry_count = 4;            // 最大重试次数
+  
+  // 动态调整
+  bool enable_dynamic_chain = 12;       // 是否启用动态拓扑调整
+  uint64 dynamic_load_threshold = 13;   // 负载阈值（如CPU使用率80%）
+  uint64 dynamic_latency_threshold_ms = 14; // 延迟阈值（毫秒）
+  
+  
+  ChainRole chain_role = 15;            // 节点在链中的角色
+}
+
+// 链角色（核心枚举）
+  enum ChainRole {
+    CHAIN_ROLE_UNSPECIFIED = 0;  // 未指定
+    CHAIN_ROLE_HEAD = 1;         // 链首领导者
+    CHAIN_ROLE_RELAY = 2;        // 中继领导者
+    CHAIN_ROLE_TAIL = 3;         // 链尾领导者
+  }
+
+// GlobalChainConfig 链式复制全局配置（新增，跨分片共性规则）
+message GlobalChainConfig {
+  uint32 max_chain_length = 1;          // 全链最大分片数
+  uint64 dynamic_adjust_interval_ms = 2; // 动态调整间隔（毫秒）
+  string service_discovery_addr = 3;    // 服务发现地址
+}

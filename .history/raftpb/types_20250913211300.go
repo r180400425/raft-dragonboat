@@ -92,7 +92,6 @@ var MessageType_name = map[int32]string{
 	30: "LeaderChainAck",
 	31: "LeaderChainPing",
 	32: "LeaderChainDisconnect", // 新增：断开连接类型映射
-	33: "LeaderChainPong",       // 新增：Pong消息类型映射
 }
 
 var MessageType_value = map[string]int32{
@@ -130,7 +129,6 @@ var MessageType_value = map[string]int32{
 	"LeaderChainAck":        30,
 	"LeaderChainPing":       31,
 	"LeaderChainDisconnect": 32, // 新增：断开连接类型反向映射
-	"LeaderChainPong":       33, // 新增：Pong消息类型反向映射
 }
 
 func (x MessageType) String() string {

@@ -1,0 +1,44 @@
+syntax = "proto3";
+package raftpb;
+
+// 导入 gogo/protobuf 扩展以支持自定义选项
+//import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+
+// protoc --gogo_out=. raftpb/chainconfig.proto
+
+
+
+// 链角色（核心枚举）
+enum ChainRole {
+  UNSPECIFIED = 0;
+  HEAD = 1;        // 链首领导者（无上游分片，prev_shard_id=0）
+  RELAY = 2;       // 中继领导者（上下游分片均存在，prev_shard_id≠0且next_shard_id≠0）
+  TAIL = 3;        // 链尾领导者（无下游分片，next_shard_id=0）
+  
+}
+
+//  链式复制配置参数（分片级）
+message ChainConfig {
+  bool enable_chain = 1;                // 是否启用链式复制
+
+  // 静态拓扑配置（对应 READAAA.md 中“初始配置默认给出”的分片连接关系）
+  uint64 prev_shard_id = 2;             // 上游分片ID（链首为0）
+  uint64 next_shard_id = 3;             // 下游分片ID（链尾为0）
+  repeated uint64 available_shards = 4; // 故障转移候选分片列表（按优先级排序）
+  //也对应列表。目前先试用单个备选节点
+
+  // 策略参数（运行时不可修改，仅初始化时配置）
+  uint64 sync_interval_ms = 5;          // 状态向量同步/健康检查间隔（毫秒）
+  uint64 max_retry_count = 6;           // 连接重试上限（非负整数）
+  
+  ChainRole chain_role = 7;             // 分片角色（与拓扑字段强校验：如 HEAD 角色的 prev_shard_id 必须为0）
+
+}
+
+
+// GlobalChainConfig 链式复制全局配置（新增，跨分片共性规则）
+message GlobalChainConfig {
+  uint32 max_chain_length = 1;          // 全链最大分片数
+  uint64 dynamic_adjust_interval_ms = 2; // 动态调整间隔（毫秒）
+  string service_discovery_addr = 3;    // 服务发现地址
+}

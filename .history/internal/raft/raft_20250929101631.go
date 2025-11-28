@@ -1707,8 +1707,9 @@ func (r *raft) becomeWitness(term uint64, leaderID uint64) {
 //   - leaderID: 领导者节点 ID
 func (r *raft) becomeFollower(term uint64, leaderID uint64) {
 	r.toFollowerState(term, leaderID, true)
-
-	// 重置链式连接状态（仅清理 chainState 中实际存在的字段）
+	// 新增：重置链式连接状态（不再是领导者，上游/下游信息失效）
+	r.chainState.upstreamLeaderID = 0       // 清空上游领导者ID
+	r.chainState.downstreamLeaderID = 0     // 清空下游领导者ID
 	r.chainState.lastAckTime = time.Time{}  // 清空最后确认时间
 	r.chainState.lastPongTime = time.Time{} // 清空最后健康检查时间
 	r.chainState.connecting = false         // 重置连接中标记
@@ -1716,7 +1717,6 @@ func (r *raft) becomeFollower(term uint64, leaderID uint64) {
 		r.chainState.healthCheckTimer.Stop() // 停止健康检查定时器
 		r.chainState.healthCheckTimer = nil  // 释放定时器资源
 	}
-	// 兼容性维护：不影响 chainState 中的静态拓扑字段（prevShardID/nextShardID），这些是固定配置信息，跟随者无需修改。
 }
 
 // becomeFollowerKE 将节点转换为跟随者状态，但不重置选举计时器（KE = Keep ElectionTimeout）。

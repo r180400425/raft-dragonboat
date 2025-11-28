@@ -711,34 +711,25 @@ func (r *raft) abortLeaderTransfer() {
 	if r.leaderTransferTarget != NoNode {
 		plog.Infof("%s aborting leader transfer to %d", r.describe(), r.leaderTransferTarget)
 
-		// 1. 发送断开通知给上游分片领导者（动态解析当前领导者）
+		// 1. 发送断开通知给上游分片领导者
 		// 新增：发送链式断开消息给下游 Shard
-		if r.chainState.prevShardID != 0 && r.resolver != nil {
-			upstreamLeaderID, err := r.resolver.GetShardLeader(r.chainState.prevShardID)
-			if err == nil && upstreamLeaderID != NoLeader {
-				disconnectMsg := pb.Message{
-					Type:    pb.LeaderChainDisconnect, // 需在 raftpb 中定义该消息类型
-					From:    r.replicaID,
-					To:      upstreamLeaderID,
-					ShardID: r.shardID,
-					Term:    r.term,
-				}
-				r.send(disconnectMsg)
-			} else {
-				plog.Warningf("%s failed to resolve upstream leader (shard %d): %v",
-					r.describe(), r.chainState.prevShardID, err)
+		if r.chainUpstream.LeaderID != 0 {
+			disconnectMsg := pb.Message{
+				Type:    pb.LeaderChainDisconnect, // 需在 raftpb 中定义
+				From:    r.replicaID,
+				To:      r.chainUpstream.LeaderID,
+				ShardID: r.shardID,
+				Term:    r.term,
 			}
+			r.send(disconnectMsg)
 		}
 
-		// 2. 重置链式连接状态（清理临时连接信息）
-		r.chainState.lastAckTime = time.Time{}  // 清空最后确认时间
-		r.chainState.lastPongTime = time.Time{} // 清空最后健康检查时间
-		r.chainState.connectRetryCount = 0      // 重置重试计数
-		r.chainState.connecting = false         // 重置连接中标记
-		if r.chainState.healthCheckTimer != nil {
-			r.chainState.healthCheckTimer.Stop() // 停止健康检查定时器
-			r.chainState.healthCheckTimer = nil  // 释放定时器资源
-		}
+		// 2. 重置上下游链式连接状态（避免残留无效连接信息）
+		r.chainUpstream = struct{ ShardID, LeaderID uint64 }{} // 清空上游信息
+		r.chainDownstream = struct {
+			ShardID, LeaderID uint64
+			lastPingAck       time.Time
+		}{} // 清空下游信息
 	}
 	// 3. 重置领导者转移目标（核心状态清理）
 	r.leaderTransferTarget = NoNode
@@ -1707,16 +1698,12 @@ func (r *raft) becomeWitness(term uint64, leaderID uint64) {
 //   - leaderID: 领导者节点 ID
 func (r *raft) becomeFollower(term uint64, leaderID uint64) {
 	r.toFollowerState(term, leaderID, true)
-
-	// 重置链式连接状态（仅清理 chainState 中实际存在的字段）
-	r.chainState.lastAckTime = time.Time{}  // 清空最后确认时间
-	r.chainState.lastPongTime = time.Time{} // 清空最后健康检查时间
-	r.chainState.connecting = false         // 重置连接中标记
-	if r.chainState.healthCheckTimer != nil {
-		r.chainState.healthCheckTimer.Stop() // 停止健康检查定时器
-		r.chainState.healthCheckTimer = nil  // 释放定时器资源
-	}
-	// 兼容性维护：不影响 chainState 中的静态拓扑字段（prevShardID/nextShardID），这些是固定配置信息，跟随者无需修改。
+	// 新增：重置链式连接状态（不再是领导者，上游信息失效）
+	// 	当节点从领导者退为跟随者时，需重置上游链式信息，避免 stale 数据：
+	r.chainUpstream = struct {
+		ShardID  uint64
+		LeaderID uint64
+	}{0, 0}
 }
 
 // becomeFollowerKE 将节点转换为跟随者状态，但不重置选举计时器（KE = Keep ElectionTimeout）。

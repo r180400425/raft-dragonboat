@@ -1,0 +1,22 @@
+syntax = "proto3";
+package raftpb;
+
+// ChainConfig 链式复制配置参数（补充双向链支持）
+message ChainConfig {
+  bool enable_chain = 1;                // 是否启用链式复制
+  uint64 default_next_shard_id = 2;     // 默认下一个分片ID（下游）
+  uint64 default_prev_shard_id = 10;    // 【新增】默认上一个分片ID（上游），支持双向链
+  uint64 health_check_interval_ms = 3;  // 健康检查间隔（毫秒）
+  int32 max_retry_count = 4;            // 最大重试次数
+  uint64 connect_timeout_ms = 5;        // 连接超时（毫秒）
+  uint32 max_hop_count = 6;             // 最大跳数
+  bool enable_tls = 7;                  // 是否启用TLS加密（仅保留开关，取消路径配置）
+  bool auto_connect = 8;                // 是否自动建立连接
+  bool chain_aware_compaction = 9;      // 是否启用链式感知日志压缩
+  // 【动态链式拓扑配置】
+  bool enable_dynamic_chain = 11;       // 是否启用动态链调整（基于负载/健康状态）
+  uint64 dynamic_adjust_interval_ms = 12; // 动态调整检测间隔（毫秒）
+  // 【可观测性配置】
+  bool enable_metrics = 13;             // 是否启用链式指标采集
+  uint64 metrics_interval_ms = 14;      // 指标采集间隔（毫秒）
+}

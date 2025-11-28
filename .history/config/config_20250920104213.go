@@ -550,209 +550,85 @@ type NodeHostConfig struct {
 	// Chain replication provides linearizable consistency across multiple shards
 	// by organizing them in a chain topology where each shard forwards operations
 	// to the next shard in the chain.
-	// Chain ChainConfig // 单个分片领导者的链式配置（原ChainConfig）
-
-	// 链式复制配置
-	Chain       ChainConfig       `json:"chain"`        // 分片级链式配置
-	GlobalChain GlobalChainConfig `json:"global_chain"` // 全局链式配置
-
-	// 【新增】全局链式配置（跨分片共性规则）
-	// GlobalChain GlobalChainConfig
+	Chain ChainConfig
 }
 
-// GlobalChainConfig 链式复制全局配置（跨分片共性规则）
-type GlobalChainConfig struct {
-	MaxChainLength        uint32        `json:"max_chain_length"`        // 全链最大分片数（避免Tchain过大）
-	DynamicAdjustInterval time.Duration `json:"dynamic_adjust_interval"` // 动态调整周期（全局检查频率）
-	ServiceDiscoveryAddr  string        `json:"service_discovery_addr"`  // 服务发现地址（生产环境必填）
-}
-
-// ChainConfig 单个分片领导者的链式配置（分片级）
+/*
+// 新增：
+// ChainConfig contains configurations for chain replication functionality.
 type ChainConfig struct {
-	// 核心开关与拓扑（与 protobuf 静态拓扑配置对齐）
-	EnableChain     bool         `json:"enable_chain"`     // 是否启用链式复制（核心开关）
-	PrevShardId     uint64       `json:"prev_shard_id"`    // 上游分片ID（替代原 DefaultPrevShardID）
-	NextShardId     uint64       `json:"next_shard_id"`    // 下游分片ID（替代原 DefaultNextShardID）
-	AvailableShards []uint64     `json:"available_shards"` // 候选分片列表（替代原 FallbackNextShardID）
-	ChainRole       pb.ChainRole `json:"chain_role"`       // 链角色（链首/中继/链尾）
+	// EnableChain specifies whether chain replication is enabled.
+	// `json:"enable_chain"`: 结构体标签(tag)，用于指定该字段在JSON序列化/反序列化时使用的键名
+	EnableChain bool `json:"enable_chain"`
 
-	// 策略参数（与 protobuf 策略参数对齐）
-	SyncIntervalMs time.Duration `json:"sync_interval_ms"` // 状态同步间隔（替代原 HealthCheckInterval）
-	MaxRetryCount  uint64        `json:"max_retry_count"`  // 重试上限（类型从 int 改为 uint64）
+	// DefaultNextShardID specifies the default next shard ID in the chain.
+	// If set to 0, the chain connection must be established manually.
+	DefaultNextShardID uint64 `json:"default_next_shard_id"`
+
+	// HealthCheckInterval specifies the interval for chain health checks.
+	HealthCheckInterval time.Duration `json:"health_check_interval"`
+
+	// MaxRetryCount specifies the maximum number of retry attempts for failed
+	// chain operations.
+	MaxRetryCount int `json:"max_retry_count"`
+
+	// ConnectTimeout specifies the timeout for establishing chain connections.
+	ConnectTimeout time.Duration `json:"connect_timeout"`
+
+	// MaxHopCount specifies the maximum number of hops allowed in the chain.
+	// This prevents infinite loops in chain topologies.
+	MaxHopCount uint32 `json:"max_hop_count"`
+
+	// EnableTLS specifies whether to use TLS encryption for chain communications.
+	EnableTLS bool `json:"enable_tls"`
+
+	// AutoConnect specifies whether to automatically establish chain connections
+	// based on the DefaultNextShardID when the node becomes leader.
+	AutoConnect bool `json:"auto_connect"`
+
+	// ChainAwareCompaction specifies whether to coordinate log compaction
+	// across the chain to ensure consistency.
+	ChainAwareCompaction bool `json:"chain_aware_compaction"`
+}
+*/
+// ChainConfig contains configurations for chain replication functionality.
+type ChainConfig struct {
+	// EnableChain specifies whether chain replication is enabled.
+	EnableChain bool
+	// DefaultNextShardID specifies the default next shard ID in the chain.
+	DefaultNextShardID uint64
+	// HealthCheckInterval specifies the interval for chain health checks.
+	HealthCheckInterval time.Duration
+	// MaxRetryCount specifies the maximum number of retry attempts for failed
+	// chain operations.
+	MaxRetryCount int
+	// ConnectTimeout specifies the timeout for establishing chain connections.
+	ConnectTimeout time.Duration
+	// MaxHopCount specifies the maximum number of hops allowed in the chain.
+	MaxHopCount uint32
+	// EnableTLS specifies whether to use TLS encryption for chain communications.
+	EnableTLS bool
+	// AutoConnect specifies whether to automatically establish chain connections
+	// based on the DefaultNextShardID when the node becomes leader.
+	AutoConnect bool
+	// ChainAwareCompaction specifies whether to coordinate log compaction
+	// across the chain to ensure consistency.
+	ChainAwareCompaction bool
 }
 
-// ChainConfig 单个分片领导者的链式配置（分片级）
-// type ChainConfig struct {
-// 	// 核心开关与拓扑
-// 	EnableChain         bool         `json:"enable_chain"`           // 是否启用链式复制（核心开关）
-// 	DefaultNextShardId  uint64       `json:"default_next_shard_id"`  // 默认下游分片ID（构建链式拓扑） // 修正：ID → Id
-// 	DefaultPrevShardId  uint64       `json:"default_prev_shard_id"`  // 上游分片ID（双向链通信） // 修正：ID → Id
-// 	FallbackNextShardId uint64       `json:"fallback_next_shard_id"` // 备用下游分片ID（故障切换） // 修正：ID → Id
-// 	ChainRole           pb.ChainRole `json:"chain_role"`             // 链角色（链首/中继/链尾，区分职责）
-
-// 	// 故障检测与恢复
-// 	HealthCheckInterval time.Duration `json:"health_check_interval"` // 健康检查间隔（故障检测基础）
-// 	MaxRetryCount       int           `json:"max_retry_count"`       // 日志重传最大重试次数
-
-// 	// 动态调整（负载/延迟触发拓扑调整）
-// 	EnableDynamicChain      bool          `json:"enable_dynamic_chain"`      // 是否启用动态拓扑调整
-// 	DynamicLoadThreshold    uint64        `json:"dynamic_load_threshold"`    // 负载阈值（如CPU使用率80%）
-// 	DynamicLatencyThreshold time.Duration `json:"dynamic_latency_threshold"` // 延迟阈值（如500ms）
-// }
-
-// IsEmpty 检查 ChainConfig 是否未配置（参考 GossipConfig.IsEmpty()）
-// IsEmpty 检查 ChainConfig 是否未配置（参考 GossipConfig.IsEmpty()）
-func (c *ChainConfig) IsEmpty() bool {
-	return !c.EnableChain &&
-		c.PrevShardId == 0 && // 新增：校验上游分片ID
-		c.NextShardId == 0 && // 新增：校验下游分片ID
-		len(c.AvailableShards) == 0 && // 新增：校验候选分片列表
-		c.SyncIntervalMs == 0 && // 新增：校验同步间隔
-		c.MaxRetryCount == 0 && // 修正：校验 uint64 类型的重试上限
-		c.ChainRole == pb.ChainRole_UNSPECIFIED
-}
-
-// ToProto 转换为 raftpb.ChainConfig Protobuf 消息（参考 Chunk.Marshal() 逻辑）
-// ToProto 转换为 raftpb.ChainConfig Protobuf 消息
-func (c *ChainConfig) ToProto() *pb.ChainConfig {
-	return &pb.ChainConfig{
-		EnableChain:     c.EnableChain,
-		PrevShardId:     c.PrevShardId,                           // 新增：映射上游分片ID
-		NextShardId:     c.NextShardId,                           // 新增：映射下游分片ID
-		AvailableShards: c.AvailableShards,                       // 新增：映射候选分片列表
-		SyncIntervalMs:  uint64(c.SyncIntervalMs.Milliseconds()), // 修正：同步间隔转毫秒
-		MaxRetryCount:   c.MaxRetryCount,                         // 修正：uint64 类型直接映射
-		ChainRole:       c.ChainRole,
-	}
-}
-
-// FromProto 从 raftpb.ChainConfig Protobuf 消息加载配置（参考 Chunk.Unmarshal() 逻辑）
-// FromProto 从 raftpb.ChainConfig Protobuf 消息加载配置
-func (c *ChainConfig) FromProto(pb *pb.ChainConfig) {
-	c.EnableChain = pb.EnableChain
-	c.PrevShardId = pb.PrevShardId                                         // 新增：加载上游分片ID
-	c.NextShardId = pb.NextShardId                                         // 新增：加载下游分片ID
-	c.AvailableShards = pb.AvailableShards                                 // 新增：加载候选分片列表
-	c.SyncIntervalMs = time.Duration(pb.SyncIntervalMs) * time.Millisecond // 修正：毫秒转 Duration
-	c.MaxRetryCount = pb.MaxRetryCount                                     // 修正：加载 uint64 类型重试上限
-	c.ChainRole = pb.ChainRole
-}
-
-// Validate validates the ChainConfig instance.
-func (c *ChainConfig) Validate() error {
-	if !c.EnableChain {
-		return nil // 未启用链式连接时不验证其他参数
-	}
-
-	// 1. 基础策略参数校验（原 HealthCheckInterval 替换为 SyncIntervalMs）
-	if c.SyncIntervalMs <= 0 {
-		return errors.New("Chain.SyncIntervalMs must be positive")
-	}
-	if c.MaxRetryCount == 0 { // 原 int 类型改为 uint64，校验是否为 0
-		return errors.New("Chain.MaxRetryCount must be greater than 0")
-	}
-
-	// 2. 链角色必须明确指定（新增校验）
-	if c.ChainRole == pb.ChainRole_UNSPECIFIED {
-		return errors.New("Chain.ChainRole must be specified when enabled")
-	}
-
-	// 3. 角色与拓扑关系校验（新增，确保角色与分片ID匹配）
-	switch c.ChainRole {
-	case pb.ChainRole_HEAD:
-		if c.PrevShardId != 0 {
-			return errors.New("HEAD node must have PrevShardId == 0")
-		}
-		if c.NextShardId == 0 && len(c.AvailableShards) == 0 {
-			return errors.New("HEAD node requires NextShardId or AvailableShards")
-		}
-	case pb.ChainRole_TAIL:
-		if c.NextShardId != 0 {
-			return errors.New("TAIL node must have NextShardId == 0")
-		}
-		if c.PrevShardId == 0 {
-			return errors.New("TAIL node requires PrevShardId != 0")
-		}
-	case pb.ChainRole_RELAY:
-		if c.PrevShardId == 0 || c.NextShardId == 0 {
-			return errors.New("RELAY node requires both PrevShardId and NextShardId")
-		}
-	}
-
-	// 4. 防环校验（原 DefaultPrevShardID/DefaultNextShardID 替换为 PrevShardId/NextShardId）
-	if c.PrevShardId != 0 && c.NextShardId != 0 && c.PrevShardId == c.NextShardId {
-		return errors.New("PrevShardId and NextShardId cannot be the same")
-	}
-
-	return nil
-}
-
-// 新增 链式连接配置的验证
-// Validate validates the ChainConfig instance.
-// func (c *ChainConfig) Validate() error {
-// 	if !c.EnableChain {
-// 		return nil // 未启用链式连接时不验证其他参数
-// 	}
-
-// 	if c.HealthCheckInterval <= 0 {
-// 		return errors.New("Chain.HealthCheckInterval must be positive")
-// 	}
-// 	if c.MaxRetryCount <= 0 {
-// 		return errors.New("Chain.MaxRetryCount must be greater than 0")
-// 	}
-// 	// 动态调整参数校验
-// 	if c.EnableDynamicChain {
-// 		if c.DynamicLoadThreshold == 0 {
-// 			return errors.New("Chain.DynamicLoadThreshold must be positive when dynamic chain is enabled")
-// 		}
-// 		if c.DynamicLatencyThreshold <= 0 {
-// 			return errors.New("Chain.DynamicLatencyThreshold must be positive when dynamic chain is enabled")
-// 		}
-// 	}
-// 	// 双向链防环校验
-// 	if c.DefaultPrevShardID != 0 && c.DefaultNextShardID != 0 && c.DefaultPrevShardID == c.DefaultNextShardID {
-// 		return errors.New("prev_shard_id and next_shard_id cannot be the same")
-// 	}
-// 	return nil
-// }
-
-// DefaultChainConfig 返回 ChainConfig 的默认值（仿照 DefaultGossipConfig）
-// DefaultChainConfig 返回 ChainConfig 的默认值
+// DefaultChainConfig returns the default chain configuration.
 func DefaultChainConfig() ChainConfig {
 	return ChainConfig{
-		EnableChain:     false,
-		PrevShardId:     0,
-		NextShardId:     0,
-		AvailableShards: []uint64{},
-		SyncIntervalMs:  500 * time.Millisecond, // 默认同步间隔 500ms
-		MaxRetryCount:   3,                      // 默认重试 3 次
-		ChainRole:       pb.ChainRole_UNSPECIFIED,
+		EnableChain:          false,
+		DefaultNextShardID:   0,
+		HealthCheckInterval:  30 * time.Second,
+		MaxRetryCount:        3,
+		ConnectTimeout:       5 * time.Second,
+		MaxHopCount:          10,
+		EnableTLS:            false,
+		AutoConnect:          false,
+		ChainAwareCompaction: true,
 	}
-}
-
-// DefaultGlobalChainConfig 返回 GlobalChainConfig 的默认值
-func DefaultGlobalChainConfig() GlobalChainConfig {
-	return GlobalChainConfig{
-		MaxChainLength:        5,                // 默认最大链长5个分片
-		DynamicAdjustInterval: 30 * time.Second, // 默认30秒调整一次
-		ServiceDiscoveryAddr:  "",               // 默认不启用服务发现
-	}
-}
-
-// ToProto 转换为 raftpb.GlobalChainConfig
-func (g *GlobalChainConfig) ToProto() *pb.GlobalChainConfig {
-	return &pb.GlobalChainConfig{
-		MaxChainLength:          g.MaxChainLength,
-		DynamicAdjustIntervalMs: uint64(g.DynamicAdjustInterval.Milliseconds()),
-		ServiceDiscoveryAddr:    g.ServiceDiscoveryAddr,
-	}
-}
-
-// FromProto 从 raftpb.GlobalChainConfig 加载配置
-func (g *GlobalChainConfig) FromProto(pb *pb.GlobalChainConfig) {
-	g.MaxChainLength = pb.MaxChainLength
-	g.DynamicAdjustInterval = time.Duration(pb.DynamicAdjustIntervalMs) * time.Millisecond
-	g.ServiceDiscoveryAddr = pb.ServiceDiscoveryAddr
 }
 
 // IFS is the filesystem interface used by tests.
@@ -879,24 +755,45 @@ func (c *NodeHostConfig) Validate() error {
 		}
 	}
 
-	// // 新增验证链条配置参数
-	// if c.Expert.ChainLeaderCount == 0 {
-	// 	return errors.New("Expert.ChainLeaderCount must be greater than 0")
-	// }
-	// if c.Expert.ChainFollowerCount == 0 {
-	// 	return errors.New("Expert.ChainFollowerCount must be greater than 0")
-	// }
+	// 新增验证链条配置参数
+	if c.Expert.ChainLeaderCount == 0 {
+		return errors.New("Expert.ChainLeaderCount must be greater than 0")
+	}
+	if c.Expert.ChainFollowerCount == 0 {
+		return errors.New("Expert.ChainFollowerCount must be greater than 0")
+	}
 
 	// 验证链式配置
-	// if err := c.Chain.Validate(); err != nil {
-	// 	return errors.Wrap(err, "invalid chain configuration")
-	// }
-	// 链式复制配置校验（启用时必须通过 Validate()）
-	if c.Chain.EnableChain {
-		if err := c.Chain.Validate(); err != nil {
-			return errors.Wrap(err, "链式配置验证失败（参考 GossipConfig.Validate()）")
-		}
+	if err := c.Chain.Validate(); err != nil {
+		return errors.Wrap(err, "invalid chain configuration")
 	}
+
+	return nil
+}
+
+// 新增 链式连接配置的验证
+// Validate validates the ChainConfig instance.
+func (c *ChainConfig) Validate() error {
+	if !c.EnableChain {
+		return nil // 未启用链式连接时不验证其他参数
+	}
+
+	if c.HealthCheckInterval <= 0 {
+		return errors.New("Chain.HealthCheckInterval must be positive")
+	}
+	if c.ConnectTimeout <= 0 {
+		return errors.New("Chain.ConnectTimeout must be positive")
+	}
+	if c.MaxRetryCount <= 0 {
+		return errors.New("Chain.MaxRetryCount must be greater than 0")
+	}
+	if c.MaxHopCount <= 0 {
+		return errors.New("Chain.MaxHopCount must be greater than 0")
+	}
+	if c.AutoConnect && c.DefaultNextShardID == 0 {
+		return errors.New("Chain.AutoConnect requires Chain.DefaultNextShardID to be set")
+	}
+
 	return nil
 }
 
@@ -987,35 +884,21 @@ func (c *NodeHostConfig) Prepare() error {
 
 	// 【新增】【链式】
 	// 设置默认链式配置
-
-	// 应用链式配置默认值（若用户未显式配置）
-	if !c.Chain.EnableChain {
-		c.Chain = DefaultChainConfig() // 使用默认分片级配置
+	if reflect.DeepEqual(c.Chain, ChainConfig{}) {
+		c.Chain = DefaultChainConfig()
 	}
-	if c.GlobalChain.MaxChainLength == 0 {
-		c.GlobalChain = DefaultGlobalChainConfig() // 使用默认全局配置
-	}
-
-	// if reflect.DeepEqual(c.Chain, ChainConfig{}) {
-	// 	c.Chain = DefaultChainConfig()
-	// }
-	// 初始化 ChainConfig 默认值（若未显式配置）
-	// if c.Chain.IsEmpty() {
-	// 	c.Chain = DefaultChainConfig() // 复用现有 DefaultChainConfig 函数
-	// 	plog.Infof("使用默认链式配置（参考 Gossip 默认配置初始化逻辑）")
-	// }
 
 	// 向后兼容性处理：如果 ExpertConfig 中有旧的链式配置，将其迁移到新的位置
-	// if c.Expert.ChainLeaderCount > 0 || c.Expert.ChainFollowerCount > 0 {
-	// 	plog.Warningf("Expert.ChainLeaderCount and Expert.ChainFollowerCount are deprecated, " +
-	// 		"please use NodeHostConfig.Chain instead")
+	if c.Expert.ChainLeaderCount > 0 || c.Expert.ChainFollowerCount > 0 {
+		plog.Warningf("Expert.ChainLeaderCount and Expert.ChainFollowerCount are deprecated, " +
+			"please use NodeHostConfig.Chain instead")
 
-	// 	// 如果新的链式配置未启用，但旧配置有值，则自动启用链式功能
-	// 	if !c.Chain.EnableChain {
-	// 		c.Chain.EnableChain = true
-	// 		plog.Infof("automatically enabled chain replication based on deprecated expert config")
-	// 	}
-	// }
+		// 如果新的链式配置未启用，但旧配置有值，则自动启用链式功能
+		if !c.Chain.EnableChain {
+			c.Chain.EnableChain = true
+			plog.Infof("automatically enabled chain replication based on deprecated expert config")
+		}
+	}
 
 	return nil
 }

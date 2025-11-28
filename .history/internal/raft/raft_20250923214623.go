@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"  // 增强型错误处理库，提供堆栈跟踪等功能
@@ -42,15 +41,6 @@ import (
 	"github.com/lni/dragonboat/v4/logger"            // 日志工具
 	"github.com/lni/dragonboat/v4/raftio"
 	pb "github.com/lni/dragonboat/v4/raftpb" // Raft协议相关的protobuf定义
-)
-
-// 新增：日志条目状态枚举（三态版本管理）
-type EntryState int32
-
-const (
-	Uncommitted EntryState = iota // 未提交：已接收但未发起本地Raft组复制
-	Committing                    // 提交中：已发起复制但未获多数派确认
-	Committed                     // 已提交：本地Raft组多数派已确认（可响应读请求）
 )
 
 // 日志
@@ -443,41 +433,30 @@ type raft struct {
 	// resolver 分片领导者地址解析器（使用本地定义的 ILeaderResolver 接口）
 	resolver ILeaderResolver
 
-	// 新增
-	// 链复制状态（新增）(分片级)
-	chainState struct {
-		nextShardID        uint64 // 当前下游分片ID（固定，不随领导者变化）
-		prevShardID        uint64 // 当前上游分片ID（固定，不随领导者变化）
-		nextShardUnhealthy bool   // 下游分片是否不健康
-
-		// ------------- 连接健康状态（可用性管理）（合并 chainDownstream.lastPingAck 功能）-----------
-		lastAckTime  time.Time // 最后连接确认时间
-		lastPongTime time.Time // 最后健康检查Pong时间
-
-		// -------------------------- 连接控制参数（重试与并发）--------------------------
-		connectRetryCount int         // 连接重试计数（累计失败次数）
-		healthCheckTimer  *time.Timer // 健康检查定时器（定期发送Ping）
-		connecting        bool        // 连接中标记（防并发连接请求）
-
-		// -------------------------- 动态调整指标（负载感知）--------------------------
-		currentLoad uint64        // 当前负载（请求数/秒，用于动态路由）
-		avgLatency  time.Duration // 平均转发延迟（用于性能监控）
+	// 新增：链式连接状态
+	chainUpstream struct {
+		ShardID  uint64 // 上游 ShardID
+		LeaderID uint64 // 上游领导者 ReplicaID
+	}
+	// 新增：下游链式连接信息
+	// 在 raft 结构体的 chainDownstream 中添加 lastPingAck 字段，用于跟踪下游 Pong 消息时间：
+	chainDownstream struct {
+		ShardID     uint64    // 下游 Raft 组 ID
+		LeaderID    uint64    // 下游领导者节点 ID
+		lastPingAck time.Time // 新增：记录最后一次收到下游 Pong 的时间
 	}
 
-	// 新增：链式复制配置字段
-	chainConfig pb.ChainConfig // 存储链式复制配置
-
-	// 扩展raft结构体，添加条目状态跟踪
-	entryStates map[uint64]EntryState // 日志条目状态：index → state
-
-	// 新增：
-	chainTailID uint64 // 链尾节点ID，用于链式复制场景下的请求转发（保留，静态链场景）
-
-}
-
-// 新增：获取链式复制配置
-func (r *raft) getChainConfig() pb.ChainConfig {
-	return r.chainConfig
+	// 新增
+	// 链复制状态（新增）
+	chainState struct {
+		nextShardID        uint64      // 当前下游分片ID
+		prevShardID        uint64      // 当前上游分片ID
+		nextShardUnhealthy bool        // 下游分片是否不健康
+		connectRetryCount  int         // 连接重试计数
+		lastAckTime        time.Time   // 最后连接确认时间
+		lastPongTime       time.Time   // 最后健康检查Pong时间
+		healthCheckTimer   *time.Timer // 健康检查定时器
+	}
 }
 
 // 创建初始化Raft节点实例，是 raft 结构体的构造函数。
@@ -711,34 +690,25 @@ func (r *raft) abortLeaderTransfer() {
 	if r.leaderTransferTarget != NoNode {
 		plog.Infof("%s aborting leader transfer to %d", r.describe(), r.leaderTransferTarget)
 
-		// 1. 发送断开通知给上游分片领导者（动态解析当前领导者）
+		// 1. 发送断开通知给上游分片领导者
 		// 新增：发送链式断开消息给下游 Shard
-		if r.chainState.prevShardID != 0 && r.resolver != nil {
-			upstreamLeaderID, err := r.resolver.GetShardLeader(r.chainState.prevShardID)
-			if err == nil && upstreamLeaderID != NoLeader {
-				disconnectMsg := pb.Message{
-					Type:    pb.LeaderChainDisconnect, // 需在 raftpb 中定义该消息类型
-					From:    r.replicaID,
-					To:      upstreamLeaderID,
-					ShardID: r.shardID,
-					Term:    r.term,
-				}
-				r.send(disconnectMsg)
-			} else {
-				plog.Warningf("%s failed to resolve upstream leader (shard %d): %v",
-					r.describe(), r.chainState.prevShardID, err)
+		if r.chainUpstream.LeaderID != 0 {
+			disconnectMsg := pb.Message{
+				Type:    pb.LeaderChainDisconnect, // 需在 raftpb 中定义
+				From:    r.replicaID,
+				To:      r.chainUpstream.LeaderID,
+				ShardID: r.shardID,
+				Term:    r.term,
 			}
+			r.send(disconnectMsg)
 		}
 
-		// 2. 重置链式连接状态（清理临时连接信息）
-		r.chainState.lastAckTime = time.Time{}  // 清空最后确认时间
-		r.chainState.lastPongTime = time.Time{} // 清空最后健康检查时间
-		r.chainState.connectRetryCount = 0      // 重置重试计数
-		r.chainState.connecting = false         // 重置连接中标记
-		if r.chainState.healthCheckTimer != nil {
-			r.chainState.healthCheckTimer.Stop() // 停止健康检查定时器
-			r.chainState.healthCheckTimer = nil  // 释放定时器资源
-		}
+		// 2. 重置上下游链式连接状态（避免残留无效连接信息）
+		r.chainUpstream = struct{ ShardID, LeaderID uint64 }{} // 清空上游信息
+		r.chainDownstream = struct {
+			ShardID, LeaderID uint64
+			lastPingAck       time.Time
+		}{} // 清空下游信息
 	}
 	// 3. 重置领导者转移目标（核心状态清理）
 	r.leaderTransferTarget = NoNode
@@ -1707,16 +1677,12 @@ func (r *raft) becomeWitness(term uint64, leaderID uint64) {
 //   - leaderID: 领导者节点 ID
 func (r *raft) becomeFollower(term uint64, leaderID uint64) {
 	r.toFollowerState(term, leaderID, true)
-
-	// 重置链式连接状态（仅清理 chainState 中实际存在的字段）
-	r.chainState.lastAckTime = time.Time{}  // 清空最后确认时间
-	r.chainState.lastPongTime = time.Time{} // 清空最后健康检查时间
-	r.chainState.connecting = false         // 重置连接中标记
-	if r.chainState.healthCheckTimer != nil {
-		r.chainState.healthCheckTimer.Stop() // 停止健康检查定时器
-		r.chainState.healthCheckTimer = nil  // 释放定时器资源
-	}
-	// 兼容性维护：不影响 chainState 中的静态拓扑字段（prevShardID/nextShardID），这些是固定配置信息，跟随者无需修改。
+	// 新增：重置链式连接状态（不再是领导者，上游信息失效）
+	// 	当节点从领导者退为跟随者时，需重置上游链式信息，避免 stale 数据：
+	r.chainUpstream = struct {
+		ShardID  uint64
+		LeaderID uint64
+	}{0, 0}
 }
 
 // becomeFollowerKE 将节点转换为跟随者状态，但不重置选举计时器（KE = Keep ElectionTimeout）。
@@ -1774,16 +1740,9 @@ func (r *raft) becomeLeader() error {
 	if !r.isLeader() && !r.isCandidate() {
 		plog.Panicf("transitioning to leader state from %v", r.state.String())
 	}
-	r.state = leader           // 更新状态为领导者
-	r.reset(r.term, true)      // 重置状态（任期不变，计时器重置）
-	r.setLeaderID(r.replicaID) // 设置领导者 ID 为自身
-	// 	领导者初始化：
-	// 在 becomeLeader 方法中，将 chainTailID 初始化为领导者自身 ID（r.replicaID）
-	// 该临时措施确保在链尾节点发现机制未实现前，系统能正常运行（请求将转发至领导者自身）
-	// 	兼容性：
-	// 新增字段默认值为 0，但通过领导者初始化确保其在集群运行时始终有效
-	// 为后续实现链尾节点动态发现机制预留扩展
-	r.chainTailID = r.replicaID              // 新增：临时默认链尾节点为自身（未实现链尾发现时）
+	r.state = leader                         // 更新状态为领导者
+	r.reset(r.term, true)                    // 重置状态（任期不变，计时器重置）
+	r.setLeaderID(r.replicaID)               // 设置领导者 ID 为自身
 	r.preLeaderPromotionHandleConfigChange() // 处理未提交的配置变更
 	plog.Infof("%s became leader", r.describe())
 
@@ -1802,7 +1761,7 @@ func (r *raft) becomeLeader() error {
 
 	// p72 of the raft thesis
 	// Raft 论文 6.4 节：领导者需追加一条空日志条目（dummy entry）以提交旧任期日志
-	// return r.appendEntries([]pb.Entry{{Type: pb.ApplicationEntry, Cmd: nil}})
+	return r.appendEntries([]pb.Entry{{Type: pb.ApplicationEntry, Cmd: nil}})
 
 	/*
 		根据 Raft 论文 6.4 节（安全性） 的规定：
@@ -1819,97 +1778,7 @@ func (r *raft) becomeLeader() error {
 		快速提交旧日志：通过主动生成空条目，确保领导者当选后立即启动日志复制流程，快速提交所有历史日志，避免集群恢复后长时间处于不一致状态。
 
 	*/
-	// 【新增】解析上下游分片领导者
-	if r.chainConfig.UpstreamShardID != 0 {
-		upstreamLeader, err := r.resolver.GetShardLeader(r.chainConfig.UpstreamShardID)
-		if err == nil && upstreamLeader != 0 {
-			r.chainState.upstreamLeaderID = upstreamLeader
-			plog.Infof("%s resolved upstream shard %d leader: %d", r.describe(), r.chainConfig.UpstreamShardID, upstreamLeader)
-		}
-	}
-	if r.chainConfig.DownstreamShardID != 0 {
-		downstreamLeader, err := r.resolver.GetShardLeader(r.chainConfig.DownstreamShardID)
-		if err == nil && downstreamLeader != 0 {
-			r.chainState.downstreamLeaderID = downstreamLeader
-			r.chainState.healthy = true
-			plog.Infof("%s resolved downstream shard %d leader: %d", r.describe(), r.chainConfig.DownstreamShardID, downstreamLeader)
-		}
-	}
 
-	return nil
-}
-
-// 4. 状态向量同步：分片级一致性检测
-// 新增 syncChainState 方法，定期与上下游分片交换状态向量，检测日志一致性偏差。
-// 【新增】分片状态向量同步（定期执行）
-func (r *raft) syncChainState() {
-	if !r.isLeader() {
-		return // 仅领导者参与状态同步
-	}
-
-	// 1. 更新本地状态向量
-	r.chainState.stateVector.LastLogIndex = r.log.lastIndex()
-	r.chainState.stateVector.SyncTimestamp = time.Now().UnixMilli()
-
-	// 2. 向上游分片发送状态向量
-	if r.chainState.upstreamShardID != 0 && r.chainState.upstreamLeaderID != 0 {
-		r.send(pb.Message{
-			Type:        pb.ShardStateVector,
-			From:        r.replicaID,
-			To:          r.chainState.upstreamLeaderID,
-			ShardID:     r.shardID,
-			StateVector: r.chainState.stateVector,
-		})
-	}
-
-	// 3. 向下游分片发送状态向量
-	if r.chainState.downstreamShardID != 0 && r.chainState.downstreamLeaderID != 0 {
-		r.send(pb.Message{
-			Type:        pb.ShardStateVector,
-			From:        r.replicaID,
-			To:          r.chainState.downstreamLeaderID,
-			ShardID:     r.shardID,
-			StateVector: r.chainState.stateVector,
-		})
-	}
-
-	// 4. 重置定时器
-	r.chainState.healthCheckTimer.Reset(r.chainConfig.SyncInterval)
-}
-
-// 【新增】处理收到的分片状态向量
-// 、被动状态处理，实现双向一致性校验
-// 核心作用
-// 接收并处理其他分片发送的状态向量，更新本地对端状态（如领导者 ID、日志进度），并触发增量同步。
-func (r *raft) handleShardStateVector(m pb.Message) error {
-	if !r.isLeader() {
-		return nil
-	}
-	senderShardID := m.ShardID
-	vec := m.StateVector
-
-	// 检查日志一致性（示例：若本地索引落后，触发增量同步）
-	// 通过对比本地与发送方的 LastLogIndex，可检测日志差异并触发同步：
-	// 这是链式复制中“追齐日志”的关键触发点，避免分片长期落后。
-	if vec.LastLogIndex > r.log.lastIndex() {
-		plog.Debugf("%s shard %d is ahead, triggering sync", r.describe(), senderShardID)
-		r.triggerIncrementalSync(senderShardID, vec.LastLogIndex)
-	}
-
-	// 更新对端状态（上游/下游）
-	// 当收到上游/下游分片的状态向量时，自动更新领导者 ID：
-	// 无需依赖额外的领导者变更事件通知，简化了动态拓扑维护逻辑。
-	if senderShardID == r.chainConfig.UpstreamShardID {
-		r.chainState.upstreamLeaderID = m.From // 更新上游领导者ID（可能已变更）
-	} else if senderShardID == r.chainConfig.DownstreamShardID {
-		r.chainState.downstreamLeaderID = m.From // 更新下游领导者ID（可能已变更）
-	}
-
-	// 连接健康状态刷新
-	// 通过 r.chainState.lastSyncTime = time.Now() 和 r.chainState.healthy = true 更新连接状态，确保 chainState 中的健康标记与实际同步情况一致，为上层路由决策提供准确依据。
-	r.chainState.lastSyncTime = time.Now()
-	r.chainState.healthy = true
-	return nil
 }
 
 // reset 重置 Raft 节点的核心状态（任期、计时器、投票、复制进度等）。
@@ -2397,61 +2266,6 @@ func (r *raft) leaderIsAvailable() {
 	r.electionTick = 0 // 重置选举计时器（避免因超时而发起新选举）
 }
 
-// sendReadIndexResp 发送 ReadIndex 响应消息给请求者
-// 参数：
-//   - m: 原始 ReadIndex 请求消息
-//   - index: 已提交的日志索引（客户端应读取此索引的数据）
-/*
-	新增方法 sendReadIndexResp：
-
-	构造 ReadIndexResp 类型消息，包含已提交的日志索引和原始请求上下文
-	确保响应消息的 To 字段设为原请求的发送者（m.From）
-	携带原请求的 Hint 和 HintHigh 上下文信息，用于客户端请求匹配
-*/
-func (r *raft) sendReadIndexResp(m pb.Message, index uint64) {
-	r.send(pb.Message{
-		To:       m.From,           // 响应目标为请求发送者
-		Type:     pb.ReadIndexResp, // 消息类型：ReadIndex 响应
-		LogIndex: index,            // 已提交的日志索引
-		Hint:     m.Hint,           // 携带原请求的低 64 位上下文
-		HintHigh: m.HintHigh,       // 携带原请求的高 64 位上下文
-	})
-}
-
-// forwardToTail 将请求转发至链尾节点（链式复制场景）
-// 参数：
-//   - m: 待转发的 ReadIndex 请求消息
-// 返回值：
-//   - error: 转发过程中遇到的错误（如链尾节点未配置）
-/*
-	新增 forwardToTail 方法：
-
-	检查链尾节点配置（chainTailID），若未配置则返回错误
-	将原请求转发至链尾节点（通过 r.send 发送）
-	添加调试日志便于追踪转发过程
-	依赖说明：
-
-	需在 raft 结构体中添加 chainTailID uint64 字段存储链尾节点ID（通常在初始化或配置变更时设置）
-	若尚未实现链尾节点发现机制，可先将 chainTailID 初始化为领导者ID作为临时兼容方案
-	错误处理：
-
-	当链尾节点未配置时，返回明确错误并记录警告日志
-	保持与原有错误处理逻辑一致，不影响其他功能
-*/
-func (r *raft) forwardToTail(m pb.Message) error {
-	// 检查链尾节点是否存在
-	if r.chainTailID == 0 {
-		plog.Warningf("%s chain tail node not configured, cannot forward ReadIndex request", r.describe())
-		return fmt.Errorf("chain tail node not available")
-	}
-
-	// 转发请求至链尾节点
-	m.To = r.chainTailID
-	r.send(m)
-	plog.Debugf("%s forwarded ReadIndex request to chain tail %s", r.describe(), ReplicaID(r.chainTailID))
-	return nil
-}
-
 // handleFollowerReplicate 处理跟随者节点收到的 Replicate 消息（日志复制请求）。
 // 更新领导者状态并调用通用复制逻辑处理日志条目。
 // 参数：
@@ -2493,17 +2307,7 @@ func (r *raft) handleFollowerReadIndex(m pb.Message) error {
 	}
 	m.To = r.leaderID // 转发目标设为当前领导者
 	r.send(m)         // 转发读请求给领导者
-	// return nil
-
-	// 新增：若本地最新条目为Committed，直接响应（优化读路径）
-	latestIndex := r.log.lastIndex()
-	if r.entryStates[latestIndex] == Committed {
-		r.sendReadIndexResp(m, latestIndex) // 直接返回本地已提交数据
-		return nil
-	}
-	// 否则转发至链尾查询（文档1.1.2节）
-	return r.forwardToTail(m)
-
+	return nil
 }
 
 // handleFollowerLeaderTransfer 处理跟随者节点收到的 LeaderTransfer 请求（领导者转移）。
@@ -3547,13 +3351,6 @@ func (r *raft) handleLeaderReplicateResp(m pb.Message, rp *remote) error {
 			r.sendReplicateMessage(m.From) // 重新发送复制消息
 		}
 	}
-
-	// 新增：本地Raft组多数派确认后，标记为Committed
-	if r.log.committed >= m.LogIndex && r.entryStates[m.LogIndex] != Committed {
-		r.entryStates[m.LogIndex] = Committed
-		plog.Debugf("%s entry %d marked as Committed", r.describe(), m.LogIndex)
-	}
-
 	return nil
 }
 
@@ -4012,9 +3809,6 @@ func (r *raft) initializeHandlerMap() {
 	r.handlers[leader][pb.LeaderChainPong] = r.handleLeaderChainPong             // 处理下游 Pong 消息
 	r.handlers[leader][pb.LeaderChainDisconnect] = r.handleLeaderChainDisconnect // 链式连接断开（需实现对应处理函数）
 
-	// 【新增】领导者状态下处理分片状态向量消息
-	r.handlers[leader][pb.ShardStateVector] = r.handleShardStateVector
-
 	// nonVoting（非投票成员状态）：仅同步日志不参与选举，用于新节点加入时的数据预热
 	r.handlers[nonVoting][pb.Heartbeat] = r.handleNonVotingHeartbeat         // 复用跟随者心跳处理器
 	r.handlers[nonVoting][pb.Replicate] = r.handleNonVotingReplicate         // 复用跟随者日志复制处理器
@@ -4113,39 +3907,6 @@ func (r *raft) checkHandlerMap() {
 
 // 新增函数
 
-// calcDynamicNextShard 动态计算下一跳分片ID（基础实现：轮询选择）
-// 参数：
-//   - chainCfg: 链式复制配置，包含可用分片列表和动态选择策略
-// 返回值：
-//   - uint64: 计算得到的下一跳分片ID
-//   - error: 计算过程中遇到的错误（如无可用分片）
-/*
-	新增动态分片选择方法：
-
-	实现 calcDynamicNextShard 方法，提供基础的轮询选择逻辑（可扩展为更复杂的动态策略）
-	使用原子操作 atomic.AddUint64 确保轮询索引的线程安全自增
-	从配置的 AvailableShards 列表中选择下一跳分片，避免硬编码依赖
-	配置依赖：
-
-	依赖 ChainConfig 中的 AvailableShards 字段（需确保配置中包含可用分片列表）
-	如需实现负载均衡/延迟感知等高级策略，可扩展该方法，添加对 r.chainState.currentLoad 和 r.chainState.avgLatency 等指标的判断逻辑
-	错误处理：
-
-	当可用分片列表为空时返回明确错误，避免空指针异常
-	与上游逻辑配合：动态选择失败时自动回退至默认分片ID
-*/
-func (r *raft) calcDynamicNextShard(chainCfg pb.ChainConfig) (uint64, error) {
-	// 基础实现：从配置的可用分片列表中轮询选择
-	if len(chainCfg.AvailableShards) == 0 {
-		return 0, fmt.Errorf("no available shards in dynamic chain config")
-	}
-
-	// 线程安全的轮询索引自增（使用原子操作避免并发问题）
-	current := atomic.AddUint64(&r.chainState.shardRoundRobinIndex, 1)
-	selectedIndex := current % uint64(len(chainCfg.AvailableShards))
-	return chainCfg.AvailableShards[selectedIndex], nil
-}
-
 /*
 优化点说明
 功能完整性：
@@ -4169,106 +3930,73 @@ func (r *raft) calcDynamicNextShard(chainCfg pb.ChainConfig) (uint64, error) {
 重试机制预留扩展点（通过定时任务重试下游无领导者的场景）。
 */
 
+// 新增：处理领导者链式连接请求
+// func (r *raft) handleLeaderChainConnect(m pb.Message) error {
+// 	// 1. 基础校验：仅领导者处理，且消息必须包含上游 ShardID 和 LeaderID
+// 	r.mustBeLeader()
+// 	if m.ShardID == 0 || m.From == 0 {
+// 		return fmt.Errorf("invalid chain connect request: shard %d, leader %d", m.ShardID, m.From)
+// 	}
+
+// 	// 2. 记录上游领导者信息（覆盖旧连接，确保最新性）
+// 	plog.Infof("%s establishing chain connection with upstream shard %d (leader %d)",
+// 		r.describe(), m.ShardID, m.From)
+// 	r.chainUpstream = struct {
+// 		ShardID  uint64 // 上游 Raft 组 ID
+// 		LeaderID uint64 // 上游领导者节点 ID
+// 	}{m.ShardID, m.From}
+
+// 	// 3. 发送连接确认（双向验证，确保上游收到）
+// 	if err := r.sendChainConnectAck(m); err != nil {
+// 		plog.Warningf("%s failed to send chain ack to upstream %d: %v", r.describe(), m.From, err)
+// 		// 不返回错误，仅记录警告（连接可重试）
+// 	}
+
+// 	// 4. 向下游 Shard 传播链式连接（递归构建完整链）
+// 	// m.NextShard 为当前 Shard 的下一跳目标 ShardID（由上游传递或配置指定）
+// 	if m.NextShard != 0 {
+// 		r.propagateChainConnect(m.NextShard)
+// 	}
+
+// 	return nil
+// }
+
 // 处理链连接请求（链首/中继领导者主动连接下游分片）
 func (r *raft) handleLeaderChainConnect(m pb.Message) error {
-	r.mustBeLeader() // 仅领导者可执行
-
-	// === 1. 角色权限校验 ===
-	chainCfg := r.getChainConfig()
-	switch chainCfg.ChainRole {
-	case pb.ChainRole_TAIL:
-		plog.Warningf("%s tail leader cannot initiate chain connect", r.describe())
-		return nil // 链尾无下游，禁止发起连接
-	case pb.ChainRole_UNSPECIFIED:
-		plog.Warningf("%s unspecified chain role, skip connect", r.describe())
-		return nil
+	r.mustBeLeader()
+	// 从ChainConfig获取下游分片ID（优先默认，故障时使用备用）
+	chainCfg := r.getChainConfig() // 需实现：从节点配置中获取ChainConfig
+	nextShardID := chainCfg.DefaultNextShardID
+	if r.chainState.nextShardUnhealthy { // 若默认下游不健康，使用备用
+		nextShardID = chainCfg.FallbackNextShardID
 	}
-
-	// === 2. 动态配置适配：优先使用动态下游分片ID（若启用动态调整） ===
-	nextShardID := chainCfg.DefaultNextShardId
-	if chainCfg.EnableDynamicChain {
-		// 动态选择下游分片（示例：基于负载/延迟阈值计算，需实现 r.calcDynamicNextShard()）
-		dynamicShardID, err := r.calcDynamicNextShard(chainCfg)
-		if err == nil && dynamicShardID != 0 {
-			nextShardID = dynamicShardID // 动态分片ID优先级高于默认
-			plog.Debugf("%s using dynamic next shard %d (load: %d, latency: %v)",
-				r.describe(), nextShardID, r.chainState.currentLoad, r.chainState.avgLatency)
-		}
-	} else if r.chainState.nextShardUnhealthy {
-		nextShardID = chainCfg.FallbackNextShardId // 静态模式下使用备用分片
-	}
-
-	// === 新增：中继节点触发星型复制（Lstar层） ===
-	if chainCfg.ChainRole == pb.ChainRole_RELAY {
-		// 中继节点接收日志后，向本地Raft组跟随者发起星型复制（文档1.1.1节）
-		r.startStarReplication()
-	}
-
-	// === 3. 参数合法性校验 ===
 	if nextShardID == 0 {
-		plog.Warningf("%s no valid next shard (default: %d, fallback: %d)",
-			r.describe(), chainCfg.DefaultNextShardId, chainCfg.FallbackNextShardId)
+		plog.Warningf("%s no next shard configured, skip connect", r.describe())
 		return nil
 	}
-	if nextShardID == r.shardID {
-		plog.Warningf("%s next shard cannot be self (shard %d)", r.describe(), r.shardID)
-		return nil // 禁止连接自身分片
-	}
 
-	// === 4. 连接状态幂等性保障 ===
-	if r.chainState.connecting {
-		plog.Debugf("%s chain connect to %d already in progress", r.describe(), nextShardID)
-		return nil // 避免并发连接请求
-	}
-	r.chainState.connecting = true                     // 标记连接中
-	defer func() { r.chainState.connecting = false }() // 释放标记
-
-	// === 5. 构建连接请求 ===
+	// 构建连接请求（携带当前分片ID、链角色等元信息）
 	connectMsg := pb.Message{
 		Type:     pb.LeaderChainConnect,
 		From:     r.replicaID,
 		To:       nextShardID,                // 目标下游分片领导者
 		Hint:     uint64(chainCfg.ChainRole), // 当前节点链角色（链首/中继）
 		HintHigh: r.shardID,                  // 当前分片ID
-		Term:     r.term,                     // 当前任期（用于下游验证消息有效性）
 	}
-
-	// === 6. 发送请求与重试逻辑 ===
+	// 发送请求并记录重试状态
 	if err := r.send(connectMsg); err != nil {
 		plog.Errorf("%s failed to send chain connect to shard %d: %v", r.describe(), nextShardID, err)
+		// 重试逻辑（基于ChainConfig.MaxRetryCount）
 		r.chainState.connectRetryCount++
-		// 重试逻辑：基于动态配置的最大重试次数
 		if r.chainState.connectRetryCount < int(chainCfg.MaxRetryCount) {
-			retryDelay := chainCfg.HealthCheckInterval / 2 // 指数退避简化为固定间隔的1/2
-			r.scheduleChainConnectRetry(retryDelay)
-			return fmt.Errorf("retry %d/%d after %v", r.chainState.connectRetryCount, chainCfg.MaxRetryCount, retryDelay)
+			r.scheduleChainConnectRetry(chainCfg.HealthCheckInterval) // 定时重试
+		} else {
+			r.chainState.nextShardUnhealthy = true // 标记下游不健康，触发备用切换
 		}
-		// 重试耗尽：触发下游不健康标记，切换至备用分片
-		r.chainState.nextShardUnhealthy = true
-		plog.Warningf("%s max retries reached, mark shard %d as unhealthy", r.describe(), nextShardID)
-		return errors.New("max retry count exceeded")
+		return err
 	}
-
-	// === 7. 连接成功：重置状态 ===
-	r.chainState.connectRetryCount = 0
-	r.chainState.nextShardUnhealthy = false
-	plog.Infof("%s chain connect request sent to shard %d (role: %s)",
-		r.describe(), nextShardID, chainCfg.ChainRole.String())
+	r.chainState.connectRetryCount = 0 // 重置重试计数
 	return nil
-}
-
-// 新增：中继节点星型复制（Lstar层）
-func (r *raft) startStarReplication() {
-	// 获取本地Raft组跟随者列表（Ki集合，文档公式3）
-	followers := r.getLocalFollowers()
-	if len(followers) == 0 {
-		return
-	}
-	// 向所有跟随者并行发送日志复制请求（星型分发，文档公式2）
-	for _, followerID := range followers {
-		r.sendReplicateMessage(followerID) // 复用现有日志复制逻辑
-	}
-	plog.Debugf("%s relay leader started star replication to %d followers", r.describe(), len(followers))
 }
 
 // 处理链连接确认（下游节点响应连接请求）
@@ -4314,7 +4042,6 @@ func (r *raft) handleLeaderChainPong(m pb.Message) error {
 }
 
 // 处理链连接断开（主动/被动断开下游连接）
-// 【先尝试重连，若。。，则动态拓扑调整】
 func (r *raft) handleLeaderChainDisconnect(m pb.Message) error {
 	r.mustBeLeader()
 	downstreamShardID := m.From
@@ -4323,42 +4050,6 @@ func (r *raft) handleLeaderChainDisconnect(m pb.Message) error {
 	plog.Warningf("%s chain connection disconnected from shard %d", r.describe(), downstreamShardID)
 	// 触发重连逻辑
 	return r.handleLeaderChainConnect(pb.Message{})
-
-	// 新增：触发动态拓扑调整（从本地Raft组选举替代节点）
-	if r.chainState.nextShardUnhealthy {
-		r.electReplacementNode(m.ShardID)
-	}
-	return nil
-}
-
-// 新增：从本地Raft组选举最优替代节点
-func (r *raft) electReplacementNode(failedShardID uint64) {
-	chainCfg := r.getChainConfig()
-	candidates := r.getLocalRaftGroupMembers() // 获取本地Raft组成员（文档公式3）
-	if len(candidates) == 0 {
-		plog.Warningf("%s no candidates for replacement", r.describe())
-		return
-	}
-
-	// 多维加权评分：CPU利用率（30%）、网络延迟（40%）、队列深度（30%）
-	bestCandidate := uint64(NoNode)
-	maxScore := float64(0)
-	for _, candidate := range candidates {
-		metrics := r.getNodeMetrics(candidate) // 获取节点实时指标
-		score := 0.3*(1-metrics.CPU) + 0.4*(1-metrics.Latency/100) + 0.3*(1-metrics.QueueDepth/1000)
-		if score > maxScore {
-			maxScore = score
-			bestCandidate = candidate
-		}
-	}
-
-	// 切换至最优候选节点
-	if bestCandidate != NoNode {
-		r.chainState.nextShardID = bestCandidate
-		r.chainState.nextShardUnhealthy = false
-		plog.Infof("%s replaced failed shard %d with candidate %d", r.describe(), failedShardID, bestCandidate)
-		r.handleLeaderChainConnect(pb.Message{}) // 重新发起连接
-	}
 }
 
 // 发送连接确认消息给上游领导者
@@ -4713,40 +4404,3 @@ func (r *raft) initHeadChain() error {
 	plog.Infof("%s head leader initialized chain with downstream shard %d", r.describe(), nextShard)
 	return nil
 }
-
-// ... 现有代码（如raft初始化函数） ...
-
-// 初始化链复制状态（新增）
-func (r *raft) initChainState() {
-	chainCfg := r.getChainConfig() // 从节点配置中获取ChainConfig
-	r.chainState.prevShardID = chainCfg.DefaultPrevShardId
-	r.chainState.nextShardID = chainCfg.DefaultNextShardId
-
-	r.entryStates = make(map[uint64]EntryState) // 初始化三态版本管理
-
-	// 若启用链式复制且为链首/中继领导者，触发初始连接
-	if chainCfg.EnableChain && (chainCfg.ChainRole == pb.ChainRole_HEAD || chainCfg.ChainRole == pb.ChainRole_RELAY) {
-		go r.handleLeaderChainConnect(pb.Message{}) // 异步发起连接
-	}
-}
-
-// 调度链健康检查（新增）
-func (r *raft) scheduleChainHealthCheck() {
-	chainCfg := r.getChainConfig()
-	interval := chainCfg.HealthCheckInterval
-	if interval <= 0 {
-		interval = 5 * time.Second // 默认5秒
-	}
-	r.chainState.healthCheckTimer = time.AfterFunc(interval, func() {
-		// 检查上次Pong是否超时
-		if time.Since(r.chainState.lastPongTime) > 2*interval {
-			r.chainState.nextShardUnhealthy = true
-			plog.Warningf("%s downstream shard %d health check timeout", r.describe(), r.chainState.nextShardID)
-		}
-		// 发送Ping并重新调度检查
-		r.Handle(pb.Message{Type: pb.LeaderChainPing})
-		r.scheduleChainHealthCheck()
-	})
-}
-
-// ... 现有代码 ...

@@ -1,0 +1,33 @@
+syntax = "proto3";
+package raftpb;
+
+// ChainConfig 链式复制配置参数（补充双向链支持）
+message ChainConfig {
+  bool enable_chain = 1;                // 是否启用链式复制
+  uint64 default_next_shard_id = 2;     // 默认下一个分片ID（下游）
+
+  uint64 fallback_next_shard_id = 10;   // 【新增】备用下一个分片ID（故障时切换）
+  uint64 default_prev_shard_id = 11;    // 上一个分片ID（双向链支持，沿用之前补充）
+
+  uint64 health_check_interval_ms = 3;  // 健康检查间隔（毫秒）
+  int32 max_retry_count = 4;            // 最大重试次数
+  uint64 connect_timeout_ms = 5;        // 连接超时（毫秒）
+  uint32 max_hop_count = 6;             // 最大跳数
+  bool enable_tls = 7;                  // 是否启用TLS加密（仅保留开关，取消路径配置）
+  bool auto_connect = 8;                // 是否自动建立连接
+  bool chain_aware_compaction = 9;      // 是否启用链式感知日志压缩
+  
+  enum ChainRole {
+        CHAIN_ROLE_UNSPECIFIED = 0;  // 未指定（默认）
+        CHAIN_ROLE_HEAD = 1;         // 链首领导者
+        CHAIN_ROLE_RELAY = 2;        // 中继领导者
+        CHAIN_ROLE_TAIL = 3;         // 链尾领导者
+  }
+  ChainRole chain_role = 12;           // 【新增】链角色标记
+
+
+  bool enable_dynamic_chain = 13;       // 启用动态链调整
+  uint64 dynamic_adjust_interval_ms = 14;// 动态调整间隔
+  uint64 dynamic_load_threshold = 15;   // 【新增】触发调整的负载阈值（如CPU使用率80%）
+  uint64 dynamic_latency_threshold_ms = 16; // 【新增】触发调整的延迟阈值（如500ms）
+}
