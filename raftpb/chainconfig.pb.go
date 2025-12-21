@@ -55,17 +55,27 @@ func (ChainRole) EnumDescriptor() ([]byte, []int) {
 // 链式复制配置参数（分片级）
 type ChainConfig struct {
 	EnableChain bool `protobuf:"varint,1,opt,name=enable_chain,json=enableChain,proto3" json:"enable_chain,omitempty"`
-	// 静态拓扑配置（对应 READAAA.md 中“初始配置默认给出”的分片连接关系）
-	PrevShardId     uint64   `protobuf:"varint,2,opt,name=prev_shard_id,json=prevShardId,proto3" json:"prev_shard_id,omitempty"`
-	NextShardId     uint64   `protobuf:"varint,3,opt,name=next_shard_id,json=nextShardId,proto3" json:"next_shard_id,omitempty"`
-	AvailableShards []uint64 `protobuf:"varint,4,rep,packed,name=available_shards,json=availableShards,proto3" json:"available_shards,omitempty"`
-	// 策略参数（运行时不可修改，仅初始化时配置）
-	SyncIntervalMs       uint64    `protobuf:"varint,5,opt,name=sync_interval_ms,json=syncIntervalMs,proto3" json:"sync_interval_ms,omitempty"`
-	MaxRetryCount        uint64    `protobuf:"varint,6,opt,name=max_retry_count,json=maxRetryCount,proto3" json:"max_retry_count,omitempty"`
-	ChainRole            ChainRole `protobuf:"varint,7,opt,name=chain_role,json=chainRole,proto3,enum=raftpb.ChainRole" json:"chain_role,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}  `json:"-"`
-	XXX_unrecognized     []byte    `json:"-"`
-	XXX_sizecache        int32     `json:"-"`
+	// 拓扑配置
+	LocalShardId            uint64    `protobuf:"varint,2,opt,name=local_shard_id,json=localShardId,proto3" json:"local_shard_id,omitempty"`
+	PrevShardId             uint64    `protobuf:"varint,3,opt,name=prev_shard_id,json=prevShardId,proto3" json:"prev_shard_id,omitempty"`
+	NextShardId             uint64    `protobuf:"varint,4,opt,name=next_shard_id,json=nextShardId,proto3" json:"next_shard_id,omitempty"`
+	LocalLeaderId           uint64    `protobuf:"varint,5,opt,name=local_leader_id,json=localLeaderId,proto3" json:"local_leader_id,omitempty"`
+	LocalLeaderAddr         string    `protobuf:"bytes,6,opt,name=local_leader_addr,json=localLeaderAddr,proto3" json:"local_leader_addr,omitempty"`
+	LocalLeaderTerm         uint64    `protobuf:"varint,7,opt,name=local_leader_term,json=localLeaderTerm,proto3" json:"local_leader_term,omitempty"`
+	AvailableShards         []uint64  `protobuf:"varint,8,rep,packed,name=available_shards,json=availableShards,proto3" json:"available_shards,omitempty"`
+	ChainRole               ChainRole `protobuf:"varint,9,opt,name=chain_role,json=chainRole,proto3,enum=raftpb.ChainRole" json:"chain_role,omitempty"`
+	FromIndex               uint64    `protobuf:"varint,10,opt,name=from_index,json=fromIndex,proto3" json:"from_index,omitempty"`
+	ToIndex                 uint64    `protobuf:"varint,11,opt,name=to_index,json=toIndex,proto3" json:"to_index,omitempty"`
+	StateVector             []byte    `protobuf:"bytes,12,opt,name=state_vector,json=stateVector,proto3" json:"state_vector,omitempty"`
+	SyncIndex               uint64    `protobuf:"varint,13,opt,name=sync_index,json=syncIndex,proto3" json:"sync_index,omitempty"`
+	Timestamp               uint64    `protobuf:"varint,14,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	DynamicAdjustIntervalMs uint64    `protobuf:"varint,15,opt,name=dynamic_adjust_interval_ms,json=dynamicAdjustIntervalMs,proto3" json:"dynamic_adjust_interval_ms,omitempty"`
+	SyncIntervalMs          uint64    `protobuf:"varint,16,opt,name=sync_interval_ms,json=syncIntervalMs,proto3" json:"sync_interval_ms,omitempty"`
+	MaxRetryCount           uint64    `protobuf:"varint,17,opt,name=max_retry_count,json=maxRetryCount,proto3" json:"max_retry_count,omitempty"`
+	ServiceDiscoveryAddr    string    `protobuf:"bytes,18,opt,name=service_discovery_addr,json=serviceDiscoveryAddr,proto3" json:"service_discovery_addr,omitempty"`
+	XXX_NoUnkeyedLiteral    struct{}  `json:"-"`
+	XXX_unrecognized        []byte    `json:"-"`
+	XXX_sizecache           int32     `json:"-"`
 }
 
 func (m *ChainConfig) Reset()         { *m = ChainConfig{} }
@@ -99,6 +109,13 @@ func (m *ChainConfig) GetEnableChain() bool {
 	return false
 }
 
+func (m *ChainConfig) GetLocalShardId() uint64 {
+	if m != nil {
+		return m.LocalShardId
+	}
+	return 0
+}
+
 func (m *ChainConfig) GetPrevShardId() uint64 {
 	if m != nil {
 		return m.PrevShardId
@@ -113,11 +130,81 @@ func (m *ChainConfig) GetNextShardId() uint64 {
 	return 0
 }
 
+func (m *ChainConfig) GetLocalLeaderId() uint64 {
+	if m != nil {
+		return m.LocalLeaderId
+	}
+	return 0
+}
+
+func (m *ChainConfig) GetLocalLeaderAddr() string {
+	if m != nil {
+		return m.LocalLeaderAddr
+	}
+	return ""
+}
+
+func (m *ChainConfig) GetLocalLeaderTerm() uint64 {
+	if m != nil {
+		return m.LocalLeaderTerm
+	}
+	return 0
+}
+
 func (m *ChainConfig) GetAvailableShards() []uint64 {
 	if m != nil {
 		return m.AvailableShards
 	}
 	return nil
+}
+
+func (m *ChainConfig) GetChainRole() ChainRole {
+	if m != nil {
+		return m.ChainRole
+	}
+	return ChainRole_UNSPECIFIED
+}
+
+func (m *ChainConfig) GetFromIndex() uint64 {
+	if m != nil {
+		return m.FromIndex
+	}
+	return 0
+}
+
+func (m *ChainConfig) GetToIndex() uint64 {
+	if m != nil {
+		return m.ToIndex
+	}
+	return 0
+}
+
+func (m *ChainConfig) GetStateVector() []byte {
+	if m != nil {
+		return m.StateVector
+	}
+	return nil
+}
+
+func (m *ChainConfig) GetSyncIndex() uint64 {
+	if m != nil {
+		return m.SyncIndex
+	}
+	return 0
+}
+
+func (m *ChainConfig) GetTimestamp() uint64 {
+	if m != nil {
+		return m.Timestamp
+	}
+	return 0
+}
+
+func (m *ChainConfig) GetDynamicAdjustIntervalMs() uint64 {
+	if m != nil {
+		return m.DynamicAdjustIntervalMs
+	}
+	return 0
 }
 
 func (m *ChainConfig) GetSyncIntervalMs() uint64 {
@@ -134,62 +221,183 @@ func (m *ChainConfig) GetMaxRetryCount() uint64 {
 	return 0
 }
 
-func (m *ChainConfig) GetChainRole() ChainRole {
+func (m *ChainConfig) GetServiceDiscoveryAddr() string {
+	if m != nil {
+		return m.ServiceDiscoveryAddr
+	}
+	return ""
+}
+
+// (链式同步请求)动态数据，用于链式复制过程中的状态同步
+type ChainSyncRequest struct {
+	EnableChain bool `protobuf:"varint,1,opt,name=enable_chain,json=enableChain,proto3" json:"enable_chain,omitempty"`
+	// 拓扑配置
+	LocalShardId            uint64    `protobuf:"varint,2,opt,name=local_shard_id,json=localShardId,proto3" json:"local_shard_id,omitempty"`
+	PrevShardId             uint64    `protobuf:"varint,3,opt,name=prev_shard_id,json=prevShardId,proto3" json:"prev_shard_id,omitempty"`
+	NextShardId             uint64    `protobuf:"varint,4,opt,name=next_shard_id,json=nextShardId,proto3" json:"next_shard_id,omitempty"`
+	LocalLeaderId           uint64    `protobuf:"varint,5,opt,name=local_leader_id,json=localLeaderId,proto3" json:"local_leader_id,omitempty"`
+	LocalLeaderAddr         string    `protobuf:"bytes,6,opt,name=local_leader_addr,json=localLeaderAddr,proto3" json:"local_leader_addr,omitempty"`
+	LocalLeaderTerm         uint64    `protobuf:"varint,7,opt,name=local_leader_term,json=localLeaderTerm,proto3" json:"local_leader_term,omitempty"`
+	AvailableShards         []uint64  `protobuf:"varint,8,rep,packed,name=available_shards,json=availableShards,proto3" json:"available_shards,omitempty"`
+	ChainRole               ChainRole `protobuf:"varint,9,opt,name=chain_role,json=chainRole,proto3,enum=raftpb.ChainRole" json:"chain_role,omitempty"`
+	FromIndex               uint64    `protobuf:"varint,10,opt,name=from_index,json=fromIndex,proto3" json:"from_index,omitempty"`
+	ToIndex                 uint64    `protobuf:"varint,11,opt,name=to_index,json=toIndex,proto3" json:"to_index,omitempty"`
+	StateVector             []byte    `protobuf:"bytes,12,opt,name=state_vector,json=stateVector,proto3" json:"state_vector,omitempty"`
+	SyncIndex               uint64    `protobuf:"varint,13,opt,name=sync_index,json=syncIndex,proto3" json:"sync_index,omitempty"`
+	Timestamp               uint64    `protobuf:"varint,14,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	DynamicAdjustIntervalMs uint64    `protobuf:"varint,15,opt,name=dynamic_adjust_interval_ms,json=dynamicAdjustIntervalMs,proto3" json:"dynamic_adjust_interval_ms,omitempty"`
+	SyncIntervalMs          uint64    `protobuf:"varint,16,opt,name=sync_interval_ms,json=syncIntervalMs,proto3" json:"sync_interval_ms,omitempty"`
+	MaxRetryCount           uint64    `protobuf:"varint,17,opt,name=max_retry_count,json=maxRetryCount,proto3" json:"max_retry_count,omitempty"`
+	ServiceDiscoveryAddr    string    `protobuf:"bytes,18,opt,name=service_discovery_addr,json=serviceDiscoveryAddr,proto3" json:"service_discovery_addr,omitempty"`
+	XXX_NoUnkeyedLiteral    struct{}  `json:"-"`
+	XXX_unrecognized        []byte    `json:"-"`
+	XXX_sizecache           int32     `json:"-"`
+}
+
+func (m *ChainSyncRequest) Reset()         { *m = ChainSyncRequest{} }
+func (m *ChainSyncRequest) String() string { return proto.CompactTextString(m) }
+func (*ChainSyncRequest) ProtoMessage()    {}
+func (*ChainSyncRequest) Descriptor() ([]byte, []int) {
+	return fileDescriptor_1dc95f5473ed323d, []int{1}
+}
+func (m *ChainSyncRequest) XXX_Unmarshal(b []byte) error {
+	return xxx_messageInfo_ChainSyncRequest.Unmarshal(m, b)
+}
+func (m *ChainSyncRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	return xxx_messageInfo_ChainSyncRequest.Marshal(b, m, deterministic)
+}
+func (m *ChainSyncRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_ChainSyncRequest.Merge(m, src)
+}
+func (m *ChainSyncRequest) XXX_Size() int {
+	return xxx_messageInfo_ChainSyncRequest.Size(m)
+}
+func (m *ChainSyncRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_ChainSyncRequest.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_ChainSyncRequest proto.InternalMessageInfo
+
+func (m *ChainSyncRequest) GetEnableChain() bool {
+	if m != nil {
+		return m.EnableChain
+	}
+	return false
+}
+
+func (m *ChainSyncRequest) GetLocalShardId() uint64 {
+	if m != nil {
+		return m.LocalShardId
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetPrevShardId() uint64 {
+	if m != nil {
+		return m.PrevShardId
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetNextShardId() uint64 {
+	if m != nil {
+		return m.NextShardId
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetLocalLeaderId() uint64 {
+	if m != nil {
+		return m.LocalLeaderId
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetLocalLeaderAddr() string {
+	if m != nil {
+		return m.LocalLeaderAddr
+	}
+	return ""
+}
+
+func (m *ChainSyncRequest) GetLocalLeaderTerm() uint64 {
+	if m != nil {
+		return m.LocalLeaderTerm
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetAvailableShards() []uint64 {
+	if m != nil {
+		return m.AvailableShards
+	}
+	return nil
+}
+
+func (m *ChainSyncRequest) GetChainRole() ChainRole {
 	if m != nil {
 		return m.ChainRole
 	}
 	return ChainRole_UNSPECIFIED
 }
 
-// GlobalChainConfig 链式复制全局配置（新增，跨分片共性规则）
-type GlobalChainConfig struct {
-	MaxChainLength          uint32   `protobuf:"varint,1,opt,name=max_chain_length,json=maxChainLength,proto3" json:"max_chain_length,omitempty"`
-	DynamicAdjustIntervalMs uint64   `protobuf:"varint,2,opt,name=dynamic_adjust_interval_ms,json=dynamicAdjustIntervalMs,proto3" json:"dynamic_adjust_interval_ms,omitempty"`
-	ServiceDiscoveryAddr    string   `protobuf:"bytes,3,opt,name=service_discovery_addr,json=serviceDiscoveryAddr,proto3" json:"service_discovery_addr,omitempty"`
-	XXX_NoUnkeyedLiteral    struct{} `json:"-"`
-	XXX_unrecognized        []byte   `json:"-"`
-	XXX_sizecache           int32    `json:"-"`
-}
-
-func (m *GlobalChainConfig) Reset()         { *m = GlobalChainConfig{} }
-func (m *GlobalChainConfig) String() string { return proto.CompactTextString(m) }
-func (*GlobalChainConfig) ProtoMessage()    {}
-func (*GlobalChainConfig) Descriptor() ([]byte, []int) {
-	return fileDescriptor_1dc95f5473ed323d, []int{1}
-}
-func (m *GlobalChainConfig) XXX_Unmarshal(b []byte) error {
-	return xxx_messageInfo_GlobalChainConfig.Unmarshal(m, b)
-}
-func (m *GlobalChainConfig) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
-	return xxx_messageInfo_GlobalChainConfig.Marshal(b, m, deterministic)
-}
-func (m *GlobalChainConfig) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_GlobalChainConfig.Merge(m, src)
-}
-func (m *GlobalChainConfig) XXX_Size() int {
-	return xxx_messageInfo_GlobalChainConfig.Size(m)
-}
-func (m *GlobalChainConfig) XXX_DiscardUnknown() {
-	xxx_messageInfo_GlobalChainConfig.DiscardUnknown(m)
-}
-
-var xxx_messageInfo_GlobalChainConfig proto.InternalMessageInfo
-
-func (m *GlobalChainConfig) GetMaxChainLength() uint32 {
+func (m *ChainSyncRequest) GetFromIndex() uint64 {
 	if m != nil {
-		return m.MaxChainLength
+		return m.FromIndex
 	}
 	return 0
 }
 
-func (m *GlobalChainConfig) GetDynamicAdjustIntervalMs() uint64 {
+func (m *ChainSyncRequest) GetToIndex() uint64 {
+	if m != nil {
+		return m.ToIndex
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetStateVector() []byte {
+	if m != nil {
+		return m.StateVector
+	}
+	return nil
+}
+
+func (m *ChainSyncRequest) GetSyncIndex() uint64 {
+	if m != nil {
+		return m.SyncIndex
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetTimestamp() uint64 {
+	if m != nil {
+		return m.Timestamp
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetDynamicAdjustIntervalMs() uint64 {
 	if m != nil {
 		return m.DynamicAdjustIntervalMs
 	}
 	return 0
 }
 
-func (m *GlobalChainConfig) GetServiceDiscoveryAddr() string {
+func (m *ChainSyncRequest) GetSyncIntervalMs() uint64 {
+	if m != nil {
+		return m.SyncIntervalMs
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetMaxRetryCount() uint64 {
+	if m != nil {
+		return m.MaxRetryCount
+	}
+	return 0
+}
+
+func (m *ChainSyncRequest) GetServiceDiscoveryAddr() string {
 	if m != nil {
 		return m.ServiceDiscoveryAddr
 	}
@@ -199,36 +407,44 @@ func (m *GlobalChainConfig) GetServiceDiscoveryAddr() string {
 func init() {
 	proto.RegisterEnum("raftpb.ChainRole", ChainRole_name, ChainRole_value)
 	proto.RegisterType((*ChainConfig)(nil), "raftpb.ChainConfig")
-	proto.RegisterType((*GlobalChainConfig)(nil), "raftpb.GlobalChainConfig")
+	proto.RegisterType((*ChainSyncRequest)(nil), "raftpb.ChainSyncRequest")
 }
 
 func init() { proto.RegisterFile("raftpb/chainconfig.proto", fileDescriptor_1dc95f5473ed323d) }
 
 var fileDescriptor_1dc95f5473ed323d = []byte{
-	// 396 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x54, 0x92, 0x41, 0x8f, 0x12, 0x31,
-	0x18, 0x86, 0x1d, 0x60, 0x71, 0xf9, 0x10, 0x98, 0x6d, 0x8c, 0x4e, 0x3c, 0x21, 0x07, 0x33, 0x7a,
-	0x40, 0xa3, 0xde, 0xf6, 0x34, 0x01, 0xd4, 0x49, 0xd0, 0x98, 0xae, 0x1e, 0x3c, 0x35, 0x65, 0xda,
-	0x5d, 0x6a, 0x3a, 0x2d, 0x69, 0xbb, 0x13, 0xf8, 0x45, 0x5e, 0xfd, 0x89, 0xa6, 0xdf, 0xc0, 0xba,
-	0x7b, 0x9b, 0x3c, 0xef, 0x33, 0x6d, 0xde, 0x37, 0x85, 0xcc, 0xf1, 0xeb, 0xb0, 0xdb, 0xbc, 0xad,
-	0xb6, 0x5c, 0x99, 0xca, 0x9a, 0x6b, 0x75, 0x33, 0xdf, 0x39, 0x1b, 0x2c, 0xe9, 0xb7, 0xc9, 0xec,
-	0x4f, 0x07, 0x86, 0x8b, 0x98, 0x2e, 0x30, 0x25, 0x2f, 0xe1, 0x89, 0x34, 0x7c, 0xa3, 0x25, 0xc3,
-	0x7f, 0xb2, 0x64, 0x9a, 0xe4, 0xe7, 0x74, 0xd8, 0x32, 0x14, 0xc9, 0x0c, 0x46, 0x3b, 0x27, 0x1b,
-	0xe6, 0xb7, 0xdc, 0x09, 0xa6, 0x44, 0xd6, 0x99, 0x26, 0x79, 0x8f, 0x0e, 0x23, 0xbc, 0x8a, 0xac,
-	0x14, 0xd1, 0x31, 0x72, 0x1f, 0xfe, 0x3b, 0xdd, 0xd6, 0x89, 0xf0, 0xe4, 0xbc, 0x86, 0x94, 0x37,
-	0x5c, 0x69, 0xbc, 0x0d, 0x45, 0x9f, 0xf5, 0xa6, 0xdd, 0xbc, 0x47, 0x27, 0x77, 0x1c, 0x5d, 0x4f,
-	0x72, 0x48, 0xfd, 0xc1, 0x54, 0x4c, 0x99, 0x20, 0x5d, 0xc3, 0x35, 0xab, 0x7d, 0x76, 0x86, 0x27,
-	0x8e, 0x23, 0x2f, 0x8f, 0xf8, 0xab, 0x27, 0xaf, 0x60, 0x52, 0xf3, 0x3d, 0x73, 0x32, 0xb8, 0x03,
-	0xab, 0xec, 0xad, 0x09, 0x59, 0x1f, 0xc5, 0x51, 0xcd, 0xf7, 0x34, 0xd2, 0x45, 0x84, 0xe4, 0x1d,
-	0x00, 0x16, 0x64, 0xce, 0x6a, 0x99, 0x3d, 0x9e, 0x26, 0xf9, 0xf8, 0xfd, 0xc5, 0xbc, 0x1d, 0x65,
-	0x8e, 0x3d, 0xa9, 0xd5, 0x92, 0x0e, 0xaa, 0xd3, 0xe7, 0xec, 0x6f, 0x02, 0x17, 0x9f, 0xb5, 0xdd,
-	0x70, 0x7d, 0x7f, 0xaf, 0x1c, 0xd2, 0x78, 0x5f, 0x7b, 0x96, 0x96, 0xe6, 0x26, 0x6c, 0x71, 0xb3,
-	0x11, 0x1d, 0xd7, 0x7c, 0x8f, 0xe6, 0x1a, 0x29, 0xb9, 0x84, 0x17, 0xe2, 0x60, 0x78, 0xad, 0x2a,
-	0xc6, 0xc5, 0xef, 0x5b, 0x1f, 0x1e, 0xb4, 0x69, 0x37, 0x7c, 0x7e, 0x34, 0x0a, 0x14, 0xee, 0xd5,
-	0xfa, 0x08, 0xcf, 0xbc, 0x74, 0x8d, 0xaa, 0x24, 0x13, 0xca, 0x57, 0xb6, 0x91, 0xee, 0xc0, 0xb8,
-	0x10, 0x0e, 0x87, 0x1d, 0xd0, 0xa7, 0xc7, 0x74, 0x79, 0x0a, 0x0b, 0x21, 0xdc, 0x9b, 0x4b, 0x18,
-	0xdc, 0x55, 0x21, 0x13, 0x18, 0xfe, 0xfc, 0x76, 0xf5, 0x7d, 0xb5, 0x28, 0x3f, 0x95, 0xab, 0x65,
-	0xfa, 0x88, 0x9c, 0x43, 0xef, 0xcb, 0xaa, 0x58, 0xa6, 0x09, 0x19, 0xc0, 0x19, 0x5d, 0xad, 0x8b,
-	0x5f, 0x69, 0x27, 0xc2, 0x1f, 0x45, 0xb9, 0x4e, 0xbb, 0x9b, 0x3e, 0x3e, 0x94, 0x0f, 0xff, 0x02,
-	0x00, 0x00, 0xff, 0xff, 0x42, 0xec, 0xfb, 0x44, 0x44, 0x02, 0x00, 0x00,
+	// 528 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xec, 0x95, 0xdf, 0x6a, 0xd4, 0x40,
+	0x14, 0x87, 0x4d, 0xdb, 0x6d, 0x37, 0x27, 0xdb, 0xdd, 0x74, 0x10, 0x1d, 0x45, 0x21, 0x2d, 0x52,
+	0x62, 0x2f, 0xaa, 0xa8, 0x77, 0xbd, 0x5a, 0xb6, 0x2b, 0x06, 0xaa, 0x48, 0x5a, 0x05, 0xaf, 0x86,
+	0x69, 0x66, 0x6a, 0x23, 0x49, 0x66, 0x9d, 0x99, 0x86, 0xdd, 0x57, 0xf5, 0xc6, 0x57, 0x91, 0x39,
+	0x93, 0xfd, 0x23, 0xbe, 0x81, 0xf4, 0x2e, 0x7c, 0xbf, 0xef, 0x9c, 0x19, 0xce, 0x19, 0x08, 0x50,
+	0xcd, 0x6f, 0xec, 0xec, 0xfa, 0x55, 0x71, 0xcb, 0xcb, 0xa6, 0x50, 0xcd, 0x4d, 0xf9, 0xfd, 0x74,
+	0xa6, 0x95, 0x55, 0x64, 0xd7, 0x27, 0x47, 0xbf, 0x7a, 0x10, 0x4d, 0x5c, 0x3a, 0xc1, 0x94, 0x1c,
+	0xc2, 0x40, 0x36, 0xfc, 0xba, 0x92, 0x0c, 0x6b, 0x68, 0x90, 0x04, 0x69, 0x3f, 0x8f, 0x3c, 0x43,
+	0x91, 0xbc, 0x80, 0x61, 0xa5, 0x0a, 0x5e, 0x31, 0x73, 0xcb, 0xb5, 0x60, 0xa5, 0xa0, 0x5b, 0x49,
+	0x90, 0xee, 0xe4, 0x03, 0xa4, 0x97, 0x0e, 0x66, 0x82, 0x1c, 0xc1, 0xfe, 0x4c, 0xcb, 0x76, 0x2d,
+	0x6d, 0xa3, 0x14, 0x39, 0xb8, 0xe1, 0x34, 0x72, 0x6e, 0xd7, 0xce, 0x8e, 0x77, 0x1c, 0x5c, 0x3a,
+	0xc7, 0x30, 0xf2, 0xa7, 0x55, 0x92, 0x0b, 0xa9, 0x9d, 0xd5, 0x43, 0x6b, 0x1f, 0xf1, 0x05, 0xd2,
+	0x4c, 0x90, 0x13, 0x38, 0xf8, 0xcb, 0xe3, 0x42, 0x68, 0xba, 0x9b, 0x04, 0x69, 0x98, 0x8f, 0x36,
+	0xcc, 0xb1, 0x10, 0xfa, 0x1f, 0xd7, 0x4a, 0x5d, 0xd3, 0x3d, 0xec, 0xba, 0xe9, 0x5e, 0x49, 0x5d,
+	0x93, 0x97, 0x10, 0xf3, 0x96, 0x97, 0x15, 0xce, 0x04, 0x2f, 0x6a, 0x68, 0x3f, 0xd9, 0x76, 0xea,
+	0x8a, 0xe3, 0x5d, 0x0d, 0x79, 0x0d, 0x80, 0x43, 0x63, 0x5a, 0x55, 0x92, 0x86, 0x49, 0x90, 0x0e,
+	0xdf, 0x1c, 0x9c, 0xfa, 0x41, 0x9f, 0xe2, 0xec, 0x72, 0x55, 0xc9, 0x3c, 0x2c, 0x96, 0x9f, 0xe4,
+	0x39, 0xc0, 0x8d, 0x56, 0x35, 0x2b, 0x1b, 0x21, 0xe7, 0x14, 0xf0, 0x06, 0xa1, 0x23, 0x99, 0x03,
+	0xe4, 0x09, 0xf4, 0xad, 0xea, 0xc2, 0x08, 0xc3, 0x3d, 0xab, 0x7c, 0x74, 0x08, 0x03, 0x63, 0xb9,
+	0x95, 0xac, 0x95, 0x85, 0x55, 0x9a, 0x0e, 0x92, 0x20, 0x1d, 0xe4, 0x11, 0xb2, 0xaf, 0x88, 0x5c,
+	0x73, 0xb3, 0x68, 0x8a, 0xae, 0x7e, 0xdf, 0x37, 0x77, 0xc4, 0x77, 0x78, 0x06, 0xa1, 0x2d, 0x6b,
+	0x69, 0x2c, 0xaf, 0x67, 0x74, 0xe8, 0xd3, 0x15, 0x20, 0x67, 0xf0, 0x54, 0x2c, 0x1a, 0x5e, 0x97,
+	0x05, 0xe3, 0xe2, 0xc7, 0x9d, 0xb1, 0xac, 0x6c, 0xac, 0xd4, 0x2d, 0xaf, 0x58, 0x6d, 0xe8, 0x08,
+	0xf5, 0xc7, 0x9d, 0x31, 0x46, 0x21, 0xeb, 0xf2, 0x8f, 0x86, 0xa4, 0x10, 0x77, 0x27, 0xaf, 0x4b,
+	0x62, 0x2c, 0x19, 0xfa, 0xf3, 0x57, 0xe6, 0x31, 0x8c, 0x6a, 0x3e, 0x67, 0x5a, 0x5a, 0xbd, 0x60,
+	0x85, 0xba, 0x6b, 0x2c, 0x3d, 0xf0, 0xdb, 0xad, 0xf9, 0x3c, 0x77, 0x74, 0xe2, 0x20, 0x79, 0x07,
+	0x8f, 0x8c, 0xd4, 0x6d, 0x59, 0x48, 0x26, 0x4a, 0x53, 0xa8, 0x56, 0xea, 0x85, 0x5f, 0x31, 0xc1,
+	0x15, 0x3f, 0xec, 0xd2, 0xf3, 0x65, 0xe8, 0xf6, 0x7c, 0xf4, 0xbb, 0x07, 0x31, 0xce, 0xfd, 0x72,
+	0xd1, 0x14, 0xb9, 0xfc, 0x79, 0x27, 0x8d, 0xbd, 0x7f, 0xe1, 0xf7, 0x2f, 0xfc, 0xbf, 0x79, 0xe1,
+	0x27, 0x67, 0x10, 0xae, 0xc6, 0x4e, 0x46, 0x10, 0x7d, 0xf9, 0x74, 0xf9, 0x79, 0x3a, 0xc9, 0xde,
+	0x67, 0xd3, 0xf3, 0xf8, 0x01, 0xe9, 0xc3, 0xce, 0x87, 0xe9, 0xf8, 0x3c, 0x0e, 0x48, 0x08, 0xbd,
+	0x7c, 0x7a, 0x31, 0xfe, 0x16, 0x6f, 0x39, 0x78, 0x35, 0xce, 0x2e, 0xe2, 0xed, 0xeb, 0x5d, 0xfc,
+	0x15, 0xbc, 0xfd, 0x13, 0x00, 0x00, 0xff, 0xff, 0xa2, 0x0e, 0x90, 0xd3, 0x26, 0x06, 0x00, 0x00,
 }

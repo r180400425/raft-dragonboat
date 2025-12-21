@@ -1,0 +1,57 @@
+syntax = "proto3";
+package raftpb;
+
+// protoc --gogo_out=. raftpb/chainconfig.proto
+
+// 链角色（核心枚举）
+enum ChainRole {
+  UNSPECIFIED = 0;
+  HEAD = 1;        // 链首领导者（无上游分片，prev_shard_id=0）
+  RELAY = 2;       // 中继领导者（上下游分片均存在，prev_shard_id≠0且next_shard_id≠0）
+  TAIL = 3;        // 链尾领导者（无下游分片，next_shard_id=0）
+  
+}
+
+
+// 链式复制配置（静态，变化频率低）
+message ChainConfig {
+  uint64 version = 1;              // 配置版本号（用于乐观锁）
+  bool enable_chain = 2;           // 是否启用链式复制
+  // 拓扑配置
+  uint64 prev_shard_id = 3;        // 上游分片ID（链首为0）
+  uint64 next_shard_id = 4;        // 下游分片ID（链尾为0）
+  repeated uint64 available_shards = 5; // 故障转移候选分片列表
+  uint64 sync_interval_ms = 6;     // 健康检查间隔（毫秒）
+  uint64 max_retry_count = 7;      // 连接重试上限
+  string service_discovery_addr = 8; // 服务发现地址
+}
+
+// 链式复制运行时状态（动态，变化频率高）
+message ChainState {
+  uint64 sync_index = 1;           // 上次同步索引
+  bool health_status = 2;          // 健康状态
+}
+
+// 心跳消息（高频传输）
+message ChainHeartbeat {
+  uint64 shard_id = 1;             // 分片ID
+  uint64 sync_index = 2;           // 当前同步索引
+  bool health_status = 3;          // 健康状态
+  uint64 timestamp = 4;            // 时间戳（毫秒级）
+}
+
+// 同步请求（高频传输）
+message ChainSyncRequest {
+  uint64 shard_id = 1;             // 分片ID
+  uint64 from_index = 2;           // 起始日志索引
+  uint64 to_index = 3;             // 结束日志索引
+  bytes entries = 4;               // 实际日志条目
+  uint64 sync_index = 5;           // 当前同步索引
+}
+
+// 配置更新（低频传输）
+message ChainConfigUpdate {
+  uint64 shard_id = 1;             // 分片ID
+  ChainConfig config = 2;          // 完整配置
+  uint64 expected_version = 3;     // 期望的当前版本
+}
